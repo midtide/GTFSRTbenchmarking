@@ -31,6 +31,10 @@ npm run build
 
 `npm run build` writes a static site to `dist/` that can be hosted anywhere (GitHub Pages, Netlify, S3). The archive bucket allows cross-origin GET/HEAD.
 
+### Publishing on GitHub Pages
+
+`.github/workflows/pages.yml` builds and publishes the site on every push to `main`. One-time setup: in the repository's **Settings → Pages**, set **Source** to **GitHub Actions**. The site then appears at `https://<user>.github.io/<repo>/`.
+
 You can also analyse one day from the command line with the same engine (Node 22.6+):
 
 ```bash
