@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ETA Benchmarks</title>
+  <meta name="description" content="ETA accuracy and completeness by route for King County Metro, computed in your browser from the public gtfsrt.io archive.">
+  <link rel="stylesheet" href="/src/ui/styles.css">
+</head>
+<body>
+  <header class="top">
+    <div class="wrap">
+      <h1>ETA Benchmarks</h1>
+      <p class="sub">King County Metro · archived GTFS-Realtime from <a href="https://gtfsrt.io" target="_blank" rel="noopener">gtfsrt.io</a> · every calculation runs in your browser</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="card controls" aria-label="Analysis settings">
+      <div class="field">
+        <label for="from">From</label>
+        <input type="date" id="from" disabled>
+      </div>
+      <div class="field">
+        <label for="to">To</label>
+        <input type="date" id="to" disabled>
+      </div>
+      <div class="field">
+        <label for="period">Time of day</label>
+        <select id="period">
+          <option value="0-30">All day</option>
+          <option value="5-9">AM peak (5–9)</option>
+          <option value="9-15">Midday (9–15)</option>
+          <option value="15-19">PM peak (15–19)</option>
+          <option value="19-24">Evening (19–24)</option>
+          <option value="24-30">Night (after midnight)</option>
+          <option value="custom">Custom…</option>
+        </select>
+      </div>
+      <div class="field custom-hours" hidden>
+        <label for="h0">Hours</label>
+        <span class="inline"><select id="h0"></select> to <select id="h1"></select></span>
+      </div>
+      <div class="field">
+        <label for="stride">Sample predictions</label>
+        <select id="stride">
+          <option value="60">Every minute</option>
+          <option value="120" selected>Every 2 minutes</option>
+          <option value="300">Every 5 minutes</option>
+        </select>
+      </div>
+      <div class="actions">
+        <button id="analyze" class="primary" disabled>Loading archive…</button>
+        <button id="stop" hidden>Stop</button>
+      </div>
+      <p class="hint" id="estimate"></p>
+    </section>
+
+    <section id="status" class="status" aria-live="polite" hidden>
+      <div class="progress"><div class="bar" id="progress-bar"></div></div>
+      <p id="status-text"></p>
+      <ul class="days" id="day-list"></ul>
+    </section>
+
+    <section id="results" hidden>
+      <div class="tiles" id="tiles"></div>
+
+      <div class="card">
+        <div class="table-head">
+          <h2>Routes</h2>
+          <div class="table-tools">
+            <input type="search" id="search" placeholder="Filter routes" aria-label="Filter routes">
+            <button id="csv">Download CSV</button>
+          </div>
+        </div>
+        <p class="hint" id="table-note"></p>
+        <div class="table-scroll">
+          <table id="routes" class="data">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card" id="detail" hidden></div>
+    </section>
+
+    <details class="card methods">
+      <summary><h2>Data &amp; methods</h2></summary>
+      <div class="prose">
+        <h3>Data</h3>
+        <p>The browser reads King County Metro's archived <code>trip_updates</code> and <code>vehicle_positions</code> Parquet files and the archived GTFS schedule directly from the public <a href="https://github.com/JarvusInnovations/gtfs-realtime-archiver" target="_blank" rel="noopener">gtfs-realtime-archiver</a> bucket behind gtfsrt.io, using HTTP range requests. Nothing is uploaded and this site never sees the data. Each archived file holds one UTC day, with one row group per poll (about every 20 seconds). A service day reads two UTC files, because evening service runs past midnight UTC.</p>
+        <p>Finished days are saved in this browser (IndexedDB), so the next visit, or a different time-of-day window, reuses them without downloading again. The schedule in force is the most recent archived version captured by the end of that day.</p>
+        <h3>Actual departures</h3>
+        <p>Actual times come from vehicle positions. A trip has departed stop <i>s</i> when its vehicle is first reported with a current stop sequence greater than <i>s</i>. The departure time is the midpoint between that report and the one before it, and is used only when the two reports are at most 2 minutes apart (KCM vehicles report about every 24 seconds). The final stop of a trip has no departure, so it is not scored for accuracy. Departures are compared with each prediction's <code>departure_time</code>. KCM publishes equal arrival and departure times, and the departure is what a waiting rider can miss.</p>
+        <h3>ETA accuracy</h3>
+        <p>Follows the <a href="https://github.com/TransitApp/ETA-Accuracy-Benchmark" target="_blank" rel="noopener">ETA Accuracy Benchmark</a>. Each sampled prediction goes into a bucket by the time from when it was published (<code>feed_timestamp</code>) to the actual departure. It is accurate when actual − predicted falls inside that bucket's window, boundaries included:</p>
+        <table class="data compact"><thead><tr><th>Bucket</th><th>Earliest</th><th>Latest</th></tr></thead>
+          <tbody><tr><td>0–3 min</td><td>30 s early</td><td>1.5 min late</td></tr><tr><td>3–6 min</td><td>1 min early</td><td>2.5 min late</td></tr><tr><td>6–10 min</td><td>1 min early</td><td>3.5 min late</td></tr><tr><td>10–15 min</td><td>1.5 min early</td><td>4.5 min late</td></tr></tbody></table>
+        <p>Overall accuracy is the straight average of the four bucket percentages, shown only when all four buckets have data. Predictions are sampled from every Nth poll; the benchmark allows a representative sample. Checked against every poll for one hour, 2-minute sampling matched within 0.6 points per bucket. Time of day is the hour of the actual departure.</p>
+        <h3>ETA completeness</h3>
+        <p>Follows the <a href="https://github.com/SwiftlyInc/ETA-Completeness-Benchmark" target="_blank" rel="noopener">ETA Completeness Benchmark</a>. Every scheduled trip-stop (from <code>stop_times</code>, for services active that day) is <b>complete</b> when either:</p>
+        <ul>
+          <li>the trip had an assigned vehicle (a vehicle position for the trip, or a <code>vehicle_id</code> in its trip update) <b>and</b> at least one sampled prediction for the stop was 0–15 minutes out, or</li>
+          <li>the trip was <code>CANCELED</code> or the stop was <code>SKIPPED</code> in the trip updates feed.</li>
+        </ul>
+        <p>Everything else is incomplete. The table splits that into trips with no vehicle and trips with a vehicle but no 0–15 minute prediction for the stop. Time of day is the hour of the scheduled departure. Ratings: ≥ 95% best in class, 90–94% good, 85–89% fair, below 85% needs improvement. With sparser sampling a very brief prediction window can be missed, so completeness can read slightly low at 5-minute sampling.</p>
+        <h3>Scope</h3>
+        <p>KCM's schedule bundle also includes Sound Transit, Seattle Streetcar and other routes. The table shows routes that appear in KCM's realtime feed in the selected days; routes in the schedule that never appear in the feed are counted in a note but left out. Realtime trip IDs that are not in the schedule are left out and counted in each day's notes.</p>
+        <p><button id="clear-cache">Clear saved results</button> <span id="clear-msg" class="hint"></span></p>
+      </div>
+    </details>
+  </main>
+  <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+  <script type="module" src="/src/ui/main.ts"></script>
+</body>
+</html>

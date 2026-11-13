@@ -1,0 +1,25 @@
+{
+  "name": "eta-benchmarks",
+  "version": "1.0.0",
+  "description": "ETA accuracy and completeness benchmarks for King County Metro, computed in the browser from the gtfsrt.io archive",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "analyze-day": "node --experimental-strip-types --no-warnings scripts/analyze-day.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "hyparquet": "1.32.0",
+    "hyparquet-compressors": "1.1.2"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "vite": "8.3.5"
+  },
+  "private": true,
+  "type": "module"
+}
