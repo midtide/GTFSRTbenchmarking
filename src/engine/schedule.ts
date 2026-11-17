@@ -236,3 +236,15 @@ export function findStopTime(s: CompiledSchedule, t: number, seq: number): numbe
   }
   return -1
 }
+
+const tripIdSets = new Map<string, Promise<Set<string>>>()
+/** Trip ids of a schedule version (cached; used to explain unmatched realtime trips). */
+export function loadTripIds(v: ScheduleVersion): Promise<Set<string>> {
+  let p = tripIdSets.get(v._feed_digest)
+  if (!p) {
+    p = readObjects(v._feed_digest, 'trips', ['trip_id']).then(rows => new Set(rows.map(r => r.trip_id ?? '')))
+      .catch(e => { tripIdSets.delete(v._feed_digest); throw e })
+    tripIdSets.set(v._feed_digest, p)
+  }
+  return p
+}

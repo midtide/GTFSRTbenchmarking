@@ -115,6 +115,29 @@ export interface VehicleStats {
   data: Int32Array
 }
 
+/** A realtime trip whose trip_id is not in the schedule in force that day. */
+export interface UnmatchedTrip {
+  trip: string
+  route: string
+  startTime: string
+  /** TripDescriptor.schedule_relationship values seen (0 scheduled, 1 added, 3 canceled, 5 replacement, 6 duplicated, 7 deleted, 8 new) */
+  relationships: number[]
+  vehicles: string[]
+  /** vehicle_label for each of vehicles (same order) */
+  vehicleLabels?: string[]
+  /** first / last time seen, epoch seconds */
+  first: number
+  last: number
+  /** trip-update snapshots it appeared in (sampled) */
+  polls: number
+  /** distinct stop sequences predicted */
+  stops: number
+  inTripUpdates: boolean
+  inVehiclePositions: boolean
+  /** date_retrieved of the most recent other archived schedule version containing this trip_id */
+  foundIn?: string
+}
+
 export interface DayResult {
   date: string
   version: number
@@ -131,6 +154,8 @@ export interface DayResult {
   stopAcc: StopAccuracy
   stopComp: StopAccuracy
   tripIssues: TripIssue[]
+  /** absent on days saved before this was recorded */
+  unmatched?: UnmatchedTrip[]
   vehicles: VehicleStats
   stats: {
     vpRows: number

@@ -4,9 +4,9 @@ import { COLUMNS, getFileIndex, KCM, netStats, readRowGroups, type FileIndex, ty
 import {
   ACC_EARLY, ACC_EARLY_SEC, ACC_LATE, ACC_LATE_SEC, ACC_N, ACC_OK, BUCKETS, STOP_COMP_FIELDS, STOP_FIELDS, stopKey, COMP_COMMUNICATED, COMP_NO_VEHICLE, COMP_PREDICTED,
   COMP_SCHEDULED, COMP_VEHICLE_NO_PRED, COMPLETENESS_HORIZON, HOURS, METRIC_VERSION,
-  accIndex, bucketOf, compIndex, newRollup, TRIP_ISSUE_THRESHOLD, VEH_FIELDS, type DayResult, type TripIssue,
+  accIndex, bucketOf, compIndex, newRollup, TRIP_ISSUE_THRESHOLD, VEH_FIELDS, type DayResult, type TripIssue, type UnmatchedTrip,
 } from './metrics.ts'
-import { activeServices, findStopTime, loadSchedule, pickScheduleVersion } from './schedule.ts'
+import { activeServices, findStopTime, loadSchedule, loadTripIds, pickScheduleVersion } from './schedule.ts'
 import { addDays, compactDate, serviceDayBase, utcDateString } from './time.ts'
 
 export interface AnalyzeOptions {
@@ -90,7 +90,16 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
     if (id !== tripCache.id) { tripCache.id = id; tripCache.idx = sched.tripIndex.get(id) ?? -1 }
     return tripCache.idx
   }
-  const unmatched = new Set<string>()
+  // Realtime trips not in the schedule, with what the feeds said about them.
+  const unmatched = new Map<string, UnmatchedTrip & { stopSet: Set<number>; lastPoll: number; vehSet: Set<string>; relSet: Set<number> }>()
+  const miss = (id: string) => {
+    let u = unmatched.get(id)
+    if (!u) {
+      unmatched.set(id, (u = { trip: id, route: '', startTime: '', relationships: [], vehicles: [], first: Infinity, last: -Infinity, polls: 0, stops: 0,
+        inTripUpdates: false, inVehiclePositions: false, stopSet: new Set(), lastPoll: NaN, vehSet: new Set(), relSet: new Set() }))
+    }
+    return u
+  }
 
   const selectGroups = (idx: FileIndex, stride: number) => {
     const out: number[] = []
@@ -144,12 +153,23 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
     const status = cols.current_status as ArrayLike<number | null>
     const ts = cols.timestamp as ArrayLike<bigint | number | null>
     const vid = (cols.vehicle_id ?? []) as (string | null)[]
+    const vroute = (cols.route_id ?? []) as (string | null)[]
     const vlabel = (cols.vehicle_label ?? []) as (string | null)[]
     for (let i = 0; i < n; i++) {
       const id = trip[i]
       if (!id || (start[i] && start[i] !== sd)) continue
       const t = lookupTrip(id)
-      if (t < 0) { unmatched.add(id); continue }
+      if (t < 0) {
+        const u = miss(id)
+        u.inVehiclePositions = true
+        if (vroute[i]) u.route ||= vroute[i]!
+        if (vid[i]) {
+          u.vehSet.add(vid[i]!)
+          if (vlabel[i] && !vehicleLabels.has(vid[i]!)) vehicleLabels.set(vid[i]!, vlabel[i]!)
+        }
+        if (ts[i] != null) { const w = Number(ts[i]); if (w < u.first) u.first = w; if (w > u.last) u.last = w }
+        continue
+      }
       const q = seq[i], when = ts[i]
       assigned[t] = 1
       seen(t)
@@ -220,11 +240,29 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
     const seq = cols.stop_sequence as ArrayLike<number | null>
     const dep = cols.departure_time as ArrayLike<bigint | number | null>
     const srel = cols.stop_schedule_relationship as ArrayLike<number | null>
+    const troute = (cols.route_id ?? []) as (string | null)[]
+    const tstart = (cols.start_time ?? []) as (string | null)[]
     for (let i = 0; i < n; i++) {
       const id = trip[i]
       if (!id || (start[i] && start[i] !== sd)) continue
       const t = lookupTrip(id)
-      if (t < 0) { unmatched.add(id); continue }
+      if (t < 0) {
+        const u = miss(id)
+        u.inTripUpdates = true
+        if (troute[i]) u.route ||= troute[i]!
+        if (tstart[i]) u.startTime ||= tstart[i]!
+        if (rel[i] != null) u.relSet.add(rel[i]!)
+        if (veh[i]) u.vehSet.add(veh[i]!)
+        if (seq[i] != null) u.stopSet.add(Number(seq[i]))
+        const f = feedTs[i]
+        if (f != null) {
+          const w = Number(f)
+          if (w !== u.lastPoll) { u.polls++; u.lastPoll = w }
+          if (w < u.first) u.first = w
+          if (w > u.last) u.last = w
+        }
+        continue
+      }
       seen(t)
       if (rel[i] === 3) canceled[t] = 1
       if (veh[i]) { assigned[t] = 1; noteVehicle(t, veh[i]!, 1) }
@@ -366,6 +404,19 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   }
   if (vehicles.data.length % VEH_FIELDS) throw new Error('vehicle layout')
 
+  // Explain unmatched trips: are they in another archived schedule version?
+  if (unmatched.size) {
+    progress('Checking other schedule versions', 0, 1)
+    const others = versions.filter(v => v._feed_digest !== sched.digest).sort((a, b) => b.date_retrieved.localeCompare(a.date_retrieved))
+    for (const v of others) {
+      try {
+        const ids = await loadTripIds(v)
+        for (const u of unmatched.values()) if (!u.foundIn && ids.has(u.trip)) u.foundIn = v.date_retrieved
+      } catch { /* a missing version only means less explanation */ }
+      if ([...unmatched.values()].every(u => u.foundIn)) break
+    }
+  }
+
   const out: Record<string, Int32Array> = {}
   for (const [r, roll] of rollups) out[sched.routeIds[r]] = roll
   const rtRoutes = sched.routeIds.filter((_, r) => rtRouteSeen[r])
@@ -375,6 +426,9 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
     date, version: METRIC_VERSION, stride: opts.stride, partial, notes,
     scheduleDigest: sched.digest, scheduleRetrieved: sched.retrieved,
     rollups: out, rtRoutes, routes: sched.routes, stopAcc, stopComp, tripIssues, vehicles,
+    unmatched: [...unmatched.values()].map(({ stopSet, lastPoll, vehSet, relSet, ...u }) => ({
+      ...u, stops: stopSet.size, vehicles: [...vehSet], vehicleLabels: [...vehSet].map(v => vehicleLabels.get(v) ?? v), relationships: [...relSet].sort(),
+    })).sort((a, b) => a.route.localeCompare(b.route, 'en', { numeric: true }) || a.startTime.localeCompare(b.startTime)),
     stats: {
       vpRows, tuRows, tuSnapshots, departures: departures.size,
       predictionsInHorizon: inHorizon, predictionsWithActual: withActual,

@@ -20,9 +20,9 @@ export const KCM = {
 export type FeedType = 'trip_updates' | 'vehicle_positions'
 
 export const COLUMNS: Record<FeedType, string[]> = {
-  trip_updates: ['feed_timestamp', 'trip_id', 'start_date', 'schedule_relationship', 'vehicle_id',
+  trip_updates: ['feed_timestamp', 'trip_id', 'route_id', 'start_date', 'start_time', 'schedule_relationship', 'vehicle_id',
     'stop_sequence', 'departure_time', 'stop_schedule_relationship'],
-  vehicle_positions: ['trip_id', 'start_date', 'current_stop_sequence', 'current_status', 'timestamp', 'vehicle_id', 'vehicle_label'],
+  vehicle_positions: ['trip_id', 'route_id', 'start_date', 'current_stop_sequence', 'current_status', 'timestamp', 'vehicle_id', 'vehicle_label'],
 }
 
 /** Bytes moved over the network by this module (for progress display). */
@@ -108,7 +108,7 @@ export interface FileIndex {
   times: Float64Array
 }
 
-const INDEX_VERSION = 3
+const INDEX_VERSION = 4
 const memIndex = new Map<string, Promise<FileIndex | null>>()
 
 export function getFileIndex(feed: FeedType, utcDate: string): Promise<FileIndex | null> {

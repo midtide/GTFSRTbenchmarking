@@ -29,10 +29,10 @@ async function init() {
   post({ type: 'ready', dateMin, dateMax, cached })
 }
 
-async function run(dates: string[], stride: number) {
+async function run(dates: string[], stride: number, force = false) {
   for (const date of dates) {
     try {
-      const hit = await cacheGet<DayResult>('days', dayKey(date, stride))
+      const hit = force ? undefined : await cacheGet<DayResult>('days', dayKey(date, stride))
       if (hit) { post({ type: 'day', result: hit, cached: true }); continue }
       const result = await analyzeDay(date, versions, {
         stride,
@@ -53,7 +53,7 @@ async function run(dates: string[], stride: number) {
 self.onmessage = (ev: MessageEvent<ToWorker>) => {
   const m = ev.data
   if (m.type === 'init') init().catch(e => post({ type: 'initError', message: e instanceof Error ? e.message : String(e) }))
-  else if (m.type === 'run') run(m.dates, m.stride)
+  else if (m.type === 'run') run(m.dates, m.stride, m.force)
   else if (m.type === 'geometry') {
     const picked = pickScheduleVersion(versions, m.date)
     if (!picked) post({ type: 'geometryError', message: `No schedule covers ${m.date}` })

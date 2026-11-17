@@ -214,3 +214,9 @@ table.trips td.hs { max-width: 220px; overflow: hidden; text-overflow: ellipsis;
 .day-chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); }
 .day-chip b { font-weight: 600; }
 .day-chip.below { border-color: var(--critical); }
+
+.note-details summary { cursor: pointer; }
+.note-details summary::marker { color: var(--text-3); }
+.unmatched { margin: 6px 0 10px; }
+.unmatched p { font-size: 13px; color: var(--text-2); margin: 6px 0; max-width: 900px; }
+.unmatched button { font-size: 13px; min-height: 30px; }

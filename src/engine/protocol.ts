@@ -3,7 +3,7 @@ import type { Geometry } from './geometry.ts'
 
 export type ToWorker =
   | { type: 'init' }
-  | { type: 'run'; dates: string[]; stride: number }
+  | { type: 'run'; dates: string[]; stride: number; force?: boolean }
   | { type: 'clearCache' }
   | { type: 'geometry'; date: string }
 

@@ -56,6 +56,7 @@ const state = {
   tripsOpen: new Set<string>(),         // panel scopes showing the full trip list
   showAll: new Set<string>(),           // panel scopes past the row cap
   coachSort: { key: 'days', dir: -1 },
+  notesOpen: new Set<string>(),         // dates whose unmatched-trip details are open
 }
 
 const key = (stride: number, date: string) => `${stride}|${date}`
@@ -158,7 +159,7 @@ function onMessage(m: FromWorker) {
   }
 }
 
-function run(dates: string[]) {
+function run(dates: string[], force = false) {
   if (!dates.length || state.running) return
   state.running = true
   state.queue = dates
@@ -169,7 +170,7 @@ function run(dates: string[]) {
   setStatus('Starting…')
   renderDays()
   updateControls()
-  send({ type: 'run', dates, stride: stride() })
+  send({ type: 'run', dates, stride: stride(), force })
 }
 
 function finishRun() {
@@ -653,7 +654,6 @@ function renderDetail() {
     ? `<span class="badge">${esc(row.info.short_name)}</span>${row.info.long_name ? ' ' + esc(row.info.long_name) : ''}`
     : 'All routes'
   els.selClear.hidden = !row
-  const notes = a.days.flatMap(d => d.notes.map(n => `${fmtDate(d.date)}: ${n}`))
   els.detail.hidden = false
   els.detail.innerHTML = `
     <h2>${row ? `Route ${esc(row.info.short_name)} by hour and bucket` : 'All routes by hour and bucket'}</h2>
@@ -675,9 +675,83 @@ function renderDetail() {
         <p class="hint">Minutes are measured from the predicted departure. "Too early" means the bus left earlier than the window allows, the worst outcome for riders. Hover or tap a segment for details.</p>
       </div>
     </div>
-    ${notes.length ? `<h3>Data notes</h3><ul class="notes">${notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul>` : ''}`
+    ${notesHtml(a.days)}`
   bindTooltips(els.detail)
 }
+
+// --- Data notes, with details of realtime trips that did not match the schedule ---
+
+const UNMATCHED_NOTE = /realtime trip IDs did not match the schedule/
+const REL: Record<number, string> = { 0: 'Scheduled', 1: 'Added', 2: 'Unscheduled', 3: 'Canceled', 5: 'Replacement', 6: 'Duplicated', 7: 'Deleted', 8: 'New' }
+const localClock = (() => {
+  const f = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', minute: '2-digit' })
+  return (epoch: number) => Number.isFinite(epoch) ? f.format(new Date(epoch * 1000)).replace(' AM', 'a').replace(' PM', 'p') : '—'
+})()
+const shortDate = (iso: string) => new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+
+function notesHtml(days: DayResult[]) {
+  const items = days.flatMap(d => d.notes.map(n => {
+    if (!UNMATCHED_NOTE.test(n)) return `<li>${fmtDate(d.date)}: ${esc(n)}</li>`
+    const open = state.notesOpen.has(d.date)
+    return `<li><details class="note-details" data-date="${d.date}" ${open ? 'open' : ''}><summary>${fmtDate(d.date)}: ${esc(n)}</summary>${unmatchedHtml(d)}</details></li>`
+  }))
+  return items.length ? `<h3>Data notes</h3><ul class="notes">${items.join('')}</ul>` : ''
+}
+
+function unmatchedHtml(d: DayResult) {
+  const u = d.unmatched
+  if (!u) return `<p class="hint">Details weren't recorded when this day was saved. <button data-action="reanalyze" data-date="${d.date}">Analyze this day again</button></p>`
+  if (!u.length) return ''
+  const labels = coachLabels([d])
+  for (const x of u) x.vehicles.forEach((v, i) => { const l = x.vehicleLabels?.[i]; if (l) labels.set(v, l) })
+  const rname = (r: string) => d.routes[r]?.short_name || r || '—'
+  const ran = u.filter(x => x.inVehiclePositions || x.relationships.some(r => r !== 3)).length
+  const canceledOnly = u.filter(x => x.relationships.length && x.relationships.every(r => r === 3) && !x.inVehiclePositions).length
+  const byVersion = new Map<string, number>()
+  for (const x of u) byVersion.set(x.foundIn ?? '', (byVersion.get(x.foundIn ?? '') ?? 0) + 1)
+  const versionText = [...byVersion].sort((a, b) => b[1] - a[1]).map(([v, n]) =>
+    v ? `${n} ${n === 1 ? 'is' : 'are'} in the schedule captured ${shortDate(v)}` : `${n} ${n === 1 ? 'is' : 'are'} in no archived schedule`).join('; ')
+  const byRoute = new Map<string, number>()
+  for (const x of u) byRoute.set(rname(x.route), (byRoute.get(rname(x.route)) ?? 0) + 1)
+  const routesText = [...byRoute].sort((a, b) => b[1] - a[1]).map(([r, n]) => `${esc(r)} (${n})`).join(', ')
+  const rows = u.map(x => `<tr>
+      <td>${esc(x.trip)}</td><td>${esc(rname(x.route))}</td><td>${esc(x.startTime || '—')}</td>
+      <td>${x.relationships.map(r => REL[r] ?? String(r)).join(', ') || '—'}</td>
+      <td>${x.vehicles.length ? x.vehicles.map(v => esc(coachName(v, labels))).join(', ') : '<span class="muted">—</span>'}</td>
+      <td>${localClock(x.first)}–${localClock(x.last)}</td>
+      <td>${x.stops || '—'}</td><td>${[x.inTripUpdates ? 'Trip updates' : '', x.inVehiclePositions ? 'Vehicle positions' : ''].filter(Boolean).join(', ')}</td>
+      <td>${x.foundIn ? shortDate(x.foundIn) : '<span class="muted">none</span>'}</td></tr>`).join('')
+  return `<div class="unmatched">
+    <p>These trips appeared in KCM's realtime feed for this service day, but their trip IDs are not in the schedule used for the day (captured ${shortDate(d.scheduleRetrieved)}), so they are not scored for accuracy or completeness. ${ran} ran with predictions or vehicle positions; ${canceledOnly} appeared only as cancellations. ${versionText}. Routes: ${routesText}.</p>
+    <button data-action="unmatched-csv" data-date="${d.date}">Download CSV</button>
+    <div class="trip-scroll"><table class="data compact trips"><thead><tr>
+      <th>Trip ID</th><th>Route</th><th>Start</th><th>Status</th><th>Coach</th><th>Seen</th><th>Stops</th><th>In feeds</th><th>In schedule captured</th>
+    </tr></thead><tbody>${rows}</tbody></table></div></div>`
+}
+
+els.detail.addEventListener('toggle', ev => {
+  const el = ev.target as HTMLElement
+  if (!(el instanceof HTMLDetailsElement) || !el.dataset.date) return
+  if (el.open) state.notesOpen.add(el.dataset.date); else state.notesOpen.delete(el.dataset.date)
+}, true)
+
+els.detail.addEventListener('click', ev => {
+  const btn = (ev.target as HTMLElement).closest<HTMLElement>('[data-action]')
+  if (!btn?.dataset.date) return
+  const day = state.results.get(key(stride(), btn.dataset.date))
+  if (btn.dataset.action === 'reanalyze') {
+    state.notesOpen.add(btn.dataset.date)
+    run([btn.dataset.date], true)
+  } else if (btn.dataset.action === 'unmatched-csv' && day?.unmatched) {
+    const labels = coachLabels([day])
+    for (const x of day.unmatched) x.vehicles.forEach((v, i) => { const l = x.vehicleLabels?.[i]; if (l) labels.set(v, l) })
+    const lines = [['date', 'trip_id', 'route', 'start_time', 'status', 'coach', 'vehicle_ids', 'first_seen', 'last_seen', 'stops', 'trip_update_polls', 'in_trip_updates', 'in_vehicle_positions', 'in_schedule_captured'],
+      ...day.unmatched.map(x => [day.date, x.trip, day.routes[x.route]?.short_name || x.route, x.startTime, x.relationships.map(r => REL[r] ?? String(r)).join(' '),
+        x.vehicles.map(v => labels.get(v) ?? v).join(' '), x.vehicles.join(' '), localClock(x.first), localClock(x.last), String(x.stops), String(x.polls),
+        String(x.inTripUpdates), String(x.inVehiclePositions), x.foundIn ? x.foundIn.slice(0, 10) : ''])]
+    saveCsv(toCsv(lines), `kcm-unmatched-trips_${day.date}.csv`)
+  }
+})
 
 const accTip = (s: Summary, h: number) => `${hourLabel(h)}–${hourLabel(h + 1)}<br>${int(s.predictions)} predictions<br>`
   + BUCKETS.map((b, i) => `${b.label}: ${s.bucketN[i] ? pct(s.bucketOk[i] / s.bucketN[i], 0) : '—'} (${int(s.bucketN[i])})`).join('<br>')
