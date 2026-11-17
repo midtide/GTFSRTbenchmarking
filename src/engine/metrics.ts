@@ -28,21 +28,23 @@ export const COMPLETENESS_HORIZON = 900
 /** Service hours 0..29 (GTFS times past midnight run beyond 24). */
 export const HOURS = 30
 
-// Per hour: 4 buckets x [n, accurate, early, late], then completeness cells.
-export const ACC_N = 0, ACC_OK = 1, ACC_EARLY = 2, ACC_LATE = 3
-export const ACC_STRIDE = 4
-export const COMP_OFFSET = BUCKETS.length * ACC_STRIDE // 16
+// Per hour: 4 buckets x [n, accurate, early, late, early seconds, late seconds],
+// then completeness cells. The seconds cells sum |actual - predicted| over the
+// too-early and too-late predictions, so averages can be derived from sums.
+export const ACC_N = 0, ACC_OK = 1, ACC_EARLY = 2, ACC_LATE = 3, ACC_EARLY_SEC = 4, ACC_LATE_SEC = 5
+export const ACC_STRIDE = 6
+export const COMP_OFFSET = BUCKETS.length * ACC_STRIDE // 24
 export const COMP_SCHEDULED = 0       // scheduled trip-stops
 export const COMP_PREDICTED = 1       // complete: vehicle assigned + 0–15 min prediction
 export const COMP_COMMUNICATED = 2    // complete: CANCELED trip or SKIPPED stop
 export const COMP_VEHICLE_NO_PRED = 3 // incomplete: vehicle assigned, no 0–15 min prediction
 export const COMP_NO_VEHICLE = 4      // incomplete: no vehicle ever assigned
 export const COMP_CELLS = 5
-export const CELLS_PER_HOUR = COMP_OFFSET + COMP_CELLS // 21
+export const CELLS_PER_HOUR = COMP_OFFSET + COMP_CELLS // 29
 export const ROUTE_CELLS = HOURS * CELLS_PER_HOUR
 
 /** Bump when a calculation changes so cached day results are not reused. */
-export const METRIC_VERSION = 1
+export const METRIC_VERSION = 2
 
 export function accIndex(hour: number, bucket: number, cell: number): number {
   return hour * CELLS_PER_HOUR + bucket * ACC_STRIDE + cell
@@ -61,6 +63,15 @@ export interface RouteInfo {
   text_color: string
 }
 
+/**
+ * Accuracy by route and stop (where the departure was predicted), sparse.
+ * keys[i] = `${route_id}\u0001${stop_id}`; data holds STOP_FIELDS ints per
+ * entry: key index * HOURS + hour, n, accurate, too early, too late.
+ */
+export const STOP_FIELDS = 5
+export interface StopAccuracy { keys: string[]; data: Int32Array }
+export const stopKey = (routeId: string, stopId: string) => `${routeId}\u0001${stopId}`
+
 export interface DayResult {
   date: string
   version: number
@@ -74,6 +85,7 @@ export interface DayResult {
   /** route_ids that appeared in realtime data this day */
   rtRoutes: string[]
   routes: Record<string, RouteInfo>
+  stopAcc: StopAccuracy
   stats: {
     vpRows: number
     tuRows: number
@@ -95,6 +107,8 @@ export interface Summary {
   bucketOk: number[]
   bucketEarly: number[]
   bucketLate: number[]
+  bucketEarlySec: number[]
+  bucketLateSec: number[]
   /** equal-weight mean of the bucket accuracies that have data (NaN if none) */
   accuracy: number
   bucketAccuracy: number[]
@@ -110,6 +124,7 @@ export interface Summary {
 export function emptySummaryCounts() {
   return {
     bucketN: [0, 0, 0, 0], bucketOk: [0, 0, 0, 0], bucketEarly: [0, 0, 0, 0], bucketLate: [0, 0, 0, 0],
+    bucketEarlySec: [0, 0, 0, 0], bucketLateSec: [0, 0, 0, 0],
     scheduled: 0, predicted: 0, communicated: 0, vehicleNoPred: 0, noVehicle: 0,
   }
 }
@@ -122,6 +137,8 @@ export function addRollup(into: SummaryCounts, r: Int32Array, h0: number, h1: nu
       into.bucketOk[b] += r[accIndex(h, b, ACC_OK)]
       into.bucketEarly[b] += r[accIndex(h, b, ACC_EARLY)]
       into.bucketLate[b] += r[accIndex(h, b, ACC_LATE)]
+      into.bucketEarlySec[b] += r[accIndex(h, b, ACC_EARLY_SEC)]
+      into.bucketLateSec[b] += r[accIndex(h, b, ACC_LATE_SEC)]
     }
     into.scheduled += r[compIndex(h, COMP_SCHEDULED)]
     into.predicted += r[compIndex(h, COMP_PREDICTED)]

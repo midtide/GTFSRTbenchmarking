@@ -14,10 +14,14 @@ export interface CompiledSchedule {
   tripIndex: Map<string, number>
   tripRoute: Int32Array          // trip -> route index
   tripService: string[]          // trip -> service_id
+  tripShape: string[]            // trip -> shape_id
   /** stop times grouped by trip: tripStart[t]..tripStart[t+1] */
   tripStart: Int32Array
   stSeq: Int32Array
   stDep: Int32Array              // seconds since service-day base
+  stStop: Int32Array             // index into stopIds
+  stDist: Float64Array           // shape_dist_traveled (NaN when missing)
+  stopIds: string[]
   calendar: Map<string, { days: boolean[]; start: string; end: string }>
   calendarDates: Map<string, Map<string, number>> // date -> service_id -> exception_type
 }
@@ -30,7 +34,7 @@ async function fileBuffer(url: string) {
   return { byteLength: buf.byteLength, slice: (s: number, e?: number) => buf.slice(s, e) }
 }
 
-async function readObjects(digest: string, table: string, columns?: string[]) {
+export async function readObjects(digest: string, table: string, columns?: string[]) {
   try {
     const file = await fileBuffer(scheduleUrl(digest, table))
     const metadata = await parquetMetadataAsync(file)
@@ -90,10 +94,10 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
   const digest = v._feed_digest
   const [routesRows, tripsRows, calRows, cdRows, st] = await Promise.all([
     readObjects(digest, 'routes'),
-    readObjects(digest, 'trips', ['route_id', 'service_id', 'trip_id']),
+    readObjects(digest, 'trips', ['route_id', 'service_id', 'trip_id', 'shape_id']),
     readObjects(digest, 'calendar'),
     readObjects(digest, 'calendar_dates'),
-    readColumns(digest, 'stop_times', ['trip_id', 'stop_sequence', 'arrival_time', 'departure_time']),
+    readColumns(digest, 'stop_times', ['trip_id', 'stop_sequence', 'arrival_time', 'departure_time', 'stop_id', 'shape_dist_traveled']),
   ])
 
   const routes: Record<string, RouteInfo> = {}
@@ -113,12 +117,14 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
   const tripIndex = new Map<string, number>()
   const tripRouteArr: number[] = []
   const tripService: string[] = []
+  const tripShape: string[] = []
   for (const t of tripsRows) {
     const id = t.trip_id ?? ''
     if (tripIndex.has(id)) continue
     tripIndex.set(id, tripRouteArr.length)
     tripRouteArr.push(routeIdx.get(t.route_id ?? '') ?? -1)
     tripService.push(t.service_id ?? '')
+    tripShape.push(t.shape_id ?? '')
   }
   const nTrips = tripRouteArr.length
 
@@ -137,6 +143,12 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
   const fill = tripStart.slice(0, nTrips)
   const stSeq = new Int32Array(tripStart[nTrips])
   const stDep = new Int32Array(tripStart[nTrips])
+  const stStop = new Int32Array(tripStart[nTrips])
+  const stDist = new Float64Array(tripStart[nTrips])
+  const stopIds: string[] = []
+  const stopIdx = new Map<string, number>()
+  const stopCol = st.stop_id as string[]
+  const distCol = st.shape_dist_traveled as (string | null)[]
   const seqCol = st.stop_sequence as string[]
   const depCol = st.departure_time as (string | null)[]
   const arrCol = st.arrival_time as (string | null)[]
@@ -145,6 +157,12 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
     if (t < 0) continue
     const j = fill[t]++
     stSeq[j] = Number(seqCol[i])
+    const sid = stopCol[i] ?? ''
+    let si = stopIdx.get(sid)
+    if (si === undefined) { si = stopIds.length; stopIdx.set(sid, si); stopIds.push(sid) }
+    stStop[j] = si
+    const dist = distCol[i]
+    stDist[j] = dist == null || dist === '' ? NaN : Number(dist)
     let dep = gtfsTimeToSeconds(depCol[i])
     if (Number.isNaN(dep)) dep = gtfsTimeToSeconds(arrCol[i])
     stDep[j] = Number.isNaN(dep) ? -1 : dep
@@ -157,8 +175,8 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
     for (let j = a + 1; j < b; j++) if (stSeq[j] < stSeq[j - 1]) { sorted = false; break }
     if (!sorted) {
       const idx = Array.from({ length: b - a }, (_, k) => a + k).sort((x, y) => stSeq[x] - stSeq[y])
-      const s2 = idx.map(k => stSeq[k]), d2 = idx.map(k => stDep[k])
-      for (let k = 0; k < idx.length; k++) { stSeq[a + k] = s2[k]; stDep[a + k] = d2[k] }
+      const s2 = idx.map(k => stSeq[k]), d2 = idx.map(k => stDep[k]), p2 = idx.map(k => stStop[k]), x2 = idx.map(k => stDist[k])
+      for (let k = 0; k < idx.length; k++) { stSeq[a + k] = s2[k]; stDep[a + k] = d2[k]; stStop[a + k] = p2[k]; stDist[a + k] = x2[k] }
     }
     let prev = -1
     for (let j = a; j < b; j++) {
@@ -185,7 +203,8 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
 
   return {
     digest, retrieved: v.date_retrieved, routes, routeIds, tripIndex,
-    tripRoute: Int32Array.from(tripRouteArr), tripService, tripStart, stSeq, stDep, calendar, calendarDates,
+    tripRoute: Int32Array.from(tripRouteArr), tripService, tripShape, tripStart, stSeq, stDep, stStop, stDist, stopIds,
+    calendar, calendarDates,
   }
 }
 
@@ -197,4 +216,17 @@ export function activeServices(s: CompiledSchedule, date: string): Set<string> {
   const ex = s.calendarDates.get(d)
   if (ex) for (const [id, type] of ex) { if (type === 1) active.add(id); else if (type === 2) active.delete(id) }
   return active
+}
+
+/** Index into the stop-time arrays for (trip, stop_sequence), or -1. */
+export function findStopTime(s: CompiledSchedule, t: number, seq: number): number {
+  let lo = s.tripStart[t], hi = s.tripStart[t + 1] - 1
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1
+    const v = s.stSeq[mid]
+    if (v === seq) return mid
+    if (v < seq) lo = mid + 1
+    else hi = mid - 1
+  }
+  return -1
 }

@@ -2,7 +2,7 @@
 // (Node, private windows): reads return undefined and writes are dropped.
 
 const DB_NAME = 'eta-benchmarks'
-const STORES = ['fileIndex', 'days'] as const
+const STORES = ['fileIndex', 'days', 'geometry'] as const
 type Store = typeof STORES[number]
 
 let dbPromise: Promise<IDBDatabase | null> | null = null
@@ -12,7 +12,7 @@ function open(): Promise<IDBDatabase | null> {
   dbPromise = new Promise(resolve => {
     try {
       if (typeof indexedDB === 'undefined') return resolve(null)
-      const req = indexedDB.open(DB_NAME, 1)
+      const req = indexedDB.open(DB_NAME, 2)
       req.onupgradeneeded = () => {
         for (const s of STORES) if (!req.result.objectStoreNames.contains(s)) req.result.createObjectStore(s)
       }

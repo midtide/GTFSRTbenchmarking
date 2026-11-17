@@ -9,6 +9,13 @@ Route-level **ETA accuracy** and **ETA completeness** for King County Metro, com
 
 The approach is modelled on [Transit Almanac](https://github.com/MisterClean/gtfsrt-dashboard). It is a static site with no server, account or upload. The browser reads Parquet straight from the archive's public bucket with HTTP range requests, and results stay on the device.
 
+## What it shows
+
+- **Summary tiles** for the selected days and time of day.
+- **A system map** on OpenStreetMap. Every stretch of route between two stops is colored by how accurate departure predictions were at the stop where it starts (red = worse, blue = better). Hover for details; click a line or a table row to single out that route.
+- **Hour-by-hour charts** of accuracy and completeness, and a **bucket chart** splitting each bucket into too early / accurate / too late, with the average minutes off for the early and late predictions.
+- **A route table** with both benchmarks, sortable and downloadable as CSV (including per-bucket early/late shares and average minutes off).
+
 ## Using it
 
 Pick a date range, a time of day and a sampling rate, then press **Analyze**. Each service day is analysed once and saved in IndexedDB. After that, changing the time-of-day window, or reloading the page, needs no download.
@@ -47,6 +54,7 @@ npm run analyze-day -- 2026-11-10 120
 src/engine/
   archive.ts    archive URLs, request limiter, compact row-group index, row-group reads (hyparquet)
   schedule.ts   choose the schedule version for a day, load and compile routes/trips/stop_times/calendars
+  geometry.ts   route shapes cut into stop-to-stop pieces for the map (cached per schedule version)
   analyze.ts    one service day -> per-route, per-hour rollups of both benchmarks
   metrics.ts    benchmark definitions, rollup layout, summaries, ratings
   cache.ts      IndexedDB (file indexes and finished days)
@@ -60,7 +68,8 @@ For each service day:
 1. **Schedule.** Uses the archived GTFS version in force (the latest one captured by the end of that day), with the trip-stops scheduled for active services.
 2. **Actual departures.** Reads every vehicle-positions poll in the day's window. A trip has departed stop *s* when its vehicle is first reported with `current_stop_sequence > s`. The departure time is the midpoint between that report and the one before it, kept only when the two are ≤ 2 minutes apart.
 3. **Predictions.** Reads trip-update polls at the chosen sampling rate (default one every 2 minutes, out of one every ~20 s). Each prediction's `departure_time` is compared with the actual departure, bucketed by time from `feed_timestamp` to actual. The same rows mark 0–15 minute predictions, `CANCELED` trips, `SKIPPED` stops and vehicle assignment for completeness.
-4. **Rollup.** Results are additive counts by route and service hour (0–29). The UI sums them for any date range and time window, and rates are always computed from summed counts.
+4. **Map data.** Each scored prediction is also counted by route, stop (where the departure was predicted) and hour. The map colors each stop-to-stop piece of route shape by the pooled accuracy at its starting stop; pieces with fewer than 20 predictions are left uncolored.
+5. **Rollup.** Results are additive counts by route and service hour (0–29). The UI sums them for any date range and time window, and rates are always computed from summed counts.
 
 ### Why these choices
 

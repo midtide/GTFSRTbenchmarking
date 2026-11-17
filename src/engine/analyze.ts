@@ -2,11 +2,11 @@
 
 import { COLUMNS, getFileIndex, KCM, netStats, readRowGroups, type FileIndex, type ScheduleVersion } from './archive.ts'
 import {
-  ACC_EARLY, ACC_LATE, ACC_N, ACC_OK, BUCKETS, COMP_COMMUNICATED, COMP_NO_VEHICLE, COMP_PREDICTED,
+  ACC_EARLY, ACC_EARLY_SEC, ACC_LATE, ACC_LATE_SEC, ACC_N, ACC_OK, BUCKETS, STOP_FIELDS, stopKey, COMP_COMMUNICATED, COMP_NO_VEHICLE, COMP_PREDICTED,
   COMP_SCHEDULED, COMP_VEHICLE_NO_PRED, COMPLETENESS_HORIZON, HOURS, METRIC_VERSION,
   accIndex, bucketOf, compIndex, newRollup, type DayResult,
 } from './metrics.ts'
-import { activeServices, loadSchedule, pickScheduleVersion } from './schedule.ts'
+import { activeServices, findStopTime, loadSchedule, pickScheduleVersion } from './schedule.ts'
 import { addDays, compactDate, serviceDayBase, utcDateString } from './time.ts'
 
 export interface AnalyzeOptions {
@@ -181,6 +181,9 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   // --- trip updates: predictions --------------------------------------------
   const rollups = new Map<number, Int32Array>()
   const rollupFor = (r: number) => { let x = rollups.get(r); if (!x) rollups.set(r, (x = newRollup())); return x }
+  // Per (route, stop) and hour: n, accurate, early, late — for the map.
+  const stopCells = new Map<number, Int32Array>()
+  const nStops = sched.stopIds.length
   const predicted = new Set<number>()
   const skipped = new Set<number>()
   let tuRows = 0, tuSnapshots = 0, inHorizon = 0, withActual = 0
@@ -230,9 +233,18 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
       const roll = rollupFor(r)
       const err = actual - pred
       roll[accIndex(hour, b, ACC_N)]++
-      if (err < -BUCKETS[b].early) roll[accIndex(hour, b, ACC_EARLY)]++
-      else if (err > BUCKETS[b].late) roll[accIndex(hour, b, ACC_LATE)]++
+      let cls = 1 // 1 accurate, 2 early, 3 late
+      if (err < -BUCKETS[b].early) { roll[accIndex(hour, b, ACC_EARLY)]++; roll[accIndex(hour, b, ACC_EARLY_SEC)] += Math.round(-err); cls = 2 }
+      else if (err > BUCKETS[b].late) { roll[accIndex(hour, b, ACC_LATE)]++; roll[accIndex(hour, b, ACC_LATE_SEC)] += Math.round(err); cls = 3 }
       else roll[accIndex(hour, b, ACC_OK)]++
+      const j = findStopTime(sched, t, Number(q))
+      if (j >= 0) {
+        const sk = r * nStops + sched.stStop[j]
+        let cells = stopCells.get(sk)
+        if (!cells) stopCells.set(sk, (cells = new Int32Array(HOURS * 4)))
+        cells[hour * 4]++
+        cells[hour * 4 + cls]++
+      }
     }
     tuRows += n
     tuSnapshots += g.length
@@ -259,6 +271,19 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
     }
   }
 
+  const stopKeys: string[] = []
+  const stopData: number[] = []
+  for (const [sk, cells] of stopCells) {
+    const ki = stopKeys.length
+    stopKeys.push(stopKey(sched.routeIds[Math.floor(sk / nStops)], sched.stopIds[sk % nStops]))
+    for (let h = 0; h < HOURS; h++) {
+      if (!cells[h * 4]) continue
+      stopData.push(ki * HOURS + h, cells[h * 4], cells[h * 4 + 1], cells[h * 4 + 2], cells[h * 4 + 3])
+    }
+  }
+  const stopAcc = { keys: stopKeys, data: Int32Array.from(stopData) }
+  if (stopAcc.data.length % STOP_FIELDS) throw new Error('stop accuracy layout')
+
   const out: Record<string, Int32Array> = {}
   for (const [r, roll] of rollups) out[sched.routeIds[r]] = roll
   const rtRoutes = sched.routeIds.filter((_, r) => rtRouteSeen[r])
@@ -267,7 +292,7 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   return {
     date, version: METRIC_VERSION, stride: opts.stride, partial, notes,
     scheduleDigest: sched.digest, scheduleRetrieved: sched.retrieved,
-    rollups: out, rtRoutes, routes: sched.routes,
+    rollups: out, rtRoutes, routes: sched.routes, stopAcc,
     stats: {
       vpRows, tuRows, tuSnapshots, departures: departures.size,
       predictionsInHorizon: inHorizon, predictionsWithActual: withActual,

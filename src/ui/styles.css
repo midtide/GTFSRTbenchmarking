@@ -155,3 +155,14 @@ code { font-size: 13px; background: var(--surface-2); padding: 0 4px; border-rad
   .table-tools input { flex: 1; width: auto; min-width: 0; }
   .table-tools button { flex: none; }
 }
+
+.map { height: 520px; border-radius: 8px; margin-top: 10px; border: 1px solid var(--border); background: var(--surface-2); z-index: 0; }
+.map .leaflet-tile-pane { filter: grayscale(0.65) contrast(0.95); }
+:root[data-theme="dark"] .map .leaflet-tile-pane { filter: grayscale(0.8) brightness(0.75); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .map .leaflet-tile-pane { filter: grayscale(0.8) brightness(0.75); } }
+.map-legend { margin-top: 8px; }
+.map-legend span.dash::before { background: none; border-top: 2px dashed var(--c); height: 0; width: 14px; vertical-align: 3px; border-radius: 0; }
+.stack .sub { grid-column: 2 / 4; font-size: 12px; color: var(--text-2); margin: -3px 0 4px; }
+.stack .sub b { font-weight: 600; color: var(--text); }
+.stack .track i { cursor: pointer; }
+@media (max-width: 640px) { .map { height: 380px; } }

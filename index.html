@@ -65,6 +65,19 @@
     <section id="results" hidden>
       <div class="tiles" id="tiles"></div>
 
+      <div class="card" id="map-card">
+        <div class="table-head">
+          <h2 id="sel-title">All routes</h2>
+          <button id="sel-clear" hidden>Show all routes</button>
+        </div>
+        <p class="hint">Each stretch of route is colored by how accurate departure predictions were at the stop where it starts. Hover for details; click a route to select it.</p>
+        <div id="map" class="map" role="region" aria-label="Map of prediction accuracy along routes"></div>
+        <div class="legend map-legend" id="map-legend"></div>
+        <p class="hint" id="map-note"></p>
+      </div>
+
+      <div class="card" id="detail" hidden></div>
+
       <div class="card">
         <div class="table-head">
           <h2>Routes</h2>
@@ -82,7 +95,6 @@
         </div>
       </div>
 
-      <div class="card" id="detail" hidden></div>
     </section>
 
     <details class="card methods">
@@ -98,6 +110,9 @@
         <table class="data compact"><thead><tr><th>Bucket</th><th>Earliest</th><th>Latest</th></tr></thead>
           <tbody><tr><td>0–3 min</td><td>30 s early</td><td>1.5 min late</td></tr><tr><td>3–6 min</td><td>1 min early</td><td>2.5 min late</td></tr><tr><td>6–10 min</td><td>1 min early</td><td>3.5 min late</td></tr><tr><td>10–15 min</td><td>1.5 min early</td><td>4.5 min late</td></tr></tbody></table>
         <p>Overall accuracy is the straight average of the four bucket percentages, shown only when all four buckets have data. Predictions are sampled from every Nth poll; the benchmark allows a representative sample. Checked against every poll for one hour, 2-minute sampling matched within 0.6 points per bucket. Time of day is the hour of the actual departure.</p>
+        <p>The bucket chart also shows, for predictions outside the window, how far off they were on average: the mean of |actual − predicted| over the too-early predictions, and separately over the too-late ones.</p>
+        <h3>Map</h3>
+        <p>Route shapes come from the archived schedule (<code>shapes</code>, cut at each stop with <code>shape_dist_traveled</code>). Each stretch between two stops is colored by the share of accurate predictions for departures from the stop where it starts, pooled across the four buckets, because single stops rarely have enough predictions in every bucket for the four-bucket average. Stretches with fewer than 20 scored predictions are drawn dashed and uncolored. Where routes share a street, the lines overlap; select a route to see it alone. Basemap © OpenStreetMap contributors.</p>
         <h3>ETA completeness</h3>
         <p>Follows the <a href="https://github.com/SwiftlyInc/ETA-Completeness-Benchmark" target="_blank" rel="noopener">ETA Completeness Benchmark</a>. Every scheduled trip-stop (from <code>stop_times</code>, for services active that day) is <b>complete</b> when either:</p>
         <ul>

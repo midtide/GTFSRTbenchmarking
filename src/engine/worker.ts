@@ -5,6 +5,8 @@ import { cacheClear, cacheGet, cacheKeys, cachePut } from './cache.ts'
 import { METRIC_VERSION, type DayResult } from './metrics.ts'
 import type { FromWorker, ToWorker } from './protocol.ts'
 import { addDays } from './time.ts'
+import { loadGeometry } from './geometry.ts'
+import { pickScheduleVersion } from './schedule.ts'
 
 const post = (m: FromWorker) => (self as unknown as Worker).postMessage(m)
 let versions: ScheduleVersion[] = []
@@ -52,5 +54,12 @@ self.onmessage = (ev: MessageEvent<ToWorker>) => {
   const m = ev.data
   if (m.type === 'init') init().catch(e => post({ type: 'initError', message: e instanceof Error ? e.message : String(e) }))
   else if (m.type === 'run') run(m.dates, m.stride)
+  else if (m.type === 'geometry') {
+    const picked = pickScheduleVersion(versions, m.date)
+    if (!picked) post({ type: 'geometryError', message: `No schedule covers ${m.date}` })
+    else loadGeometry(picked.version).then(
+      geometry => post({ type: 'geometry', geometry }),
+      e => post({ type: 'geometryError', message: e instanceof Error ? e.message : String(e) }))
+  }
   else if (m.type === 'clearCache') cacheClear().then(() => post({ type: 'cleared' }))
 }

@@ -3,6 +3,8 @@ import {
   emptySummaryCounts, summarize, type DayResult, type RouteInfo, type Summary,
 } from '../engine/metrics.ts'
 import type { FromWorker, ToWorker } from '../engine/protocol.ts'
+import { AccuracyMap, BANDS, MIN_SEGMENT_N, type StopStat } from './map.ts'
+import { STOP_FIELDS } from '../engine/metrics.ts'
 import { dateRange } from '../engine/time.ts'
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T
@@ -16,6 +18,8 @@ const els = {
   results: $('results'), tiles: $('tiles'), table: $<HTMLTableElement>('routes'), tableNote: $('table-note'),
   search: $<HTMLInputElement>('search'), csv: $<HTMLButtonElement>('csv'), detail: $('detail'),
   tooltip: $('tooltip'), clear: $<HTMLButtonElement>('clear-cache'), clearMsg: $('clear-msg'),
+  mapEl: $('map'), mapCard: $('map-card'), mapLegend: $('map-legend'), mapNote: $('map-note'),
+  selTitle: $('sel-title'), selClear: $<HTMLButtonElement>('sel-clear'),
 }
 
 // ---------------------------------------------------------------------------
@@ -34,6 +38,9 @@ const state = {
   current: '',
   sort: { key: 'route', dir: 1 },
   selected: '' as string,
+  map: null as AccuracyMap | null,
+  geometryPending: '' as string,   // schedule digest requested
+  geometryError: '' as string,
 }
 
 const key = (stride: number, date: string) => `${stride}|${date}`
@@ -116,6 +123,17 @@ function onMessage(m: FromWorker) {
       break
     case 'done':
       finishRun()
+      break
+    case 'geometry':
+      state.geometryPending = ''
+      state.geometryError = ''
+      ensureMap().setGeometry(m.geometry)
+      renderMap()
+      break
+    case 'geometryError':
+      state.geometryPending = ''
+      state.geometryError = m.message
+      renderMap()
       break
     case 'cleared':
       state.cached.clear()
@@ -267,6 +285,68 @@ function render() {
   renderTiles(a)
   renderTable()
   renderDetail()
+  renderMap()
+}
+
+function selectRoute(id: string) {
+  state.selected = id
+  renderTable(); renderDetail(); renderMap()
+}
+els.selClear.addEventListener('click', () => selectRoute(''))
+
+function showTip(html: string, e: { clientX: number; clientY: number }) {
+  els.tooltip.innerHTML = html
+  els.tooltip.hidden = false
+  const r = els.tooltip.getBoundingClientRect()
+  let x = e.clientX + 12, yy = e.clientY + 12
+  if (x + r.width > window.innerWidth - 8) x = e.clientX - r.width - 12
+  if (yy + r.height > window.innerHeight - 8) yy = e.clientY - r.height - 12
+  els.tooltip.style.left = `${Math.max(4, x)}px`; els.tooltip.style.top = `${Math.max(4, yy)}px`
+}
+const hideTip = () => { els.tooltip.hidden = true }
+
+function ensureMap(): AccuracyMap {
+  if (!state.map) {
+    state.map = new AccuracyMap(els.mapEl, id => {
+      selectRoute(id)
+      const tr = els.table.querySelector<HTMLElement>(`tbody tr[data-id="${CSS.escape(id)}"]`)
+      tr?.scrollIntoView({ block: 'nearest' })
+    }, { show: showTip, hide: hideTip })
+    els.mapLegend.innerHTML = BANDS.map(b => `<span style="--c:${b.color}">${b.label}</span>`).join('')
+      + `<span class="dash" style="--c:#9b9a94">fewer than ${MIN_SEGMENT_N} predictions</span>`
+  }
+  return state.map
+}
+
+function renderMap() {
+  const a = aggregate()
+  if (!a.days.length) return
+  const map = ensureMap()
+  map.invalidate()
+  // Geometry comes from the schedule of the latest selected day.
+  const latest = a.days[a.days.length - 1]
+  if (!map.hasGeometry(latest.scheduleDigest) && state.geometryPending !== latest.scheduleDigest && !state.geometryError) {
+    state.geometryPending = latest.scheduleDigest
+    send({ type: 'geometry', date: latest.date })
+  }
+  const stats = new Map<string, StopStat>()
+  for (const day of a.days) {
+    const { keys, data } = day.stopAcc ?? { keys: [], data: new Int32Array() }
+    for (let i = 0; i < data.length; i += STOP_FIELDS) {
+      const h = data[i] % HOURS
+      if (h < a.h0 || h >= a.h1) continue
+      const k = keys[Math.floor(data[i] / HOURS)]
+      let st = stats.get(k)
+      if (!st) stats.set(k, (st = { n: 0, ok: 0, early: 0, late: 0 }))
+      st.n += data[i + 1]; st.ok += data[i + 2]; st.early += data[i + 3]; st.late += data[i + 4]
+    }
+  }
+  const names: Record<string, string> = {}
+  for (const r of a.rows) names[r.id] = r.info.short_name || r.id
+  map.update(stats, new Set(a.rows.map(r => r.id)), state.selected, names)
+  els.mapNote.textContent = state.geometryError ? `Could not load route shapes: ${state.geometryError}`
+    : state.geometryPending ? 'Loading route shapes…'
+    : `Pooled accuracy across all four buckets for ${hourRange(a.h0, a.h1)}. Shapes from the schedule in force on ${fmtDate(latest.date)}.`
 }
 
 function renderTiles(a: ReturnType<typeof aggregate>) {
@@ -352,8 +432,8 @@ function renderTable() {
   body.innerHTML = rows.map(r => `<tr data-id="${esc(r.id)}" class="${r.id === state.selected ? 'sel' : ''}">${COLS.map(c => c.cell(r)).join('')}</tr>`).join('')
   body.querySelectorAll<HTMLTableRowElement>('tr').forEach(tr => tr.addEventListener('click', () => {
     state.selected = state.selected === tr.dataset.id ? '' : tr.dataset.id!
-    renderTable(); renderDetail()
-    if (state.selected) els.detail.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    selectRoute(state.selected)
+    if (state.selected && els.mapCard.getBoundingClientRect().top < 0) els.mapCard.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }))
   els.tableNote.textContent = `Bucket figures need at least ${MIN_BUCKET_N} predictions; overall accuracy needs all four buckets. Click a route for its hour-by-hour profile.`
     + (a.scheduleOnly ? ` ${a.scheduleOnly} scheduled route${a.scheduleOnly > 1 ? 's' : ''} that never appear in KCM's realtime feed are left out.` : '')
@@ -370,13 +450,14 @@ function renderDetail() {
   for (let h = h0; h < h1; h++) if (hrs[h].scheduled || hrs[h].predictions) { lo = Math.min(lo, h); hi = Math.max(hi, h + 1) }
   if (lo >= hi) { lo = h0; hi = h1 }
   const span = Array.from({ length: hi - lo }, (_, i) => lo + i)
-  const title = row
-    ? `<span class="badge">${esc(row.info.short_name)}</span> ${esc(row.info.long_name)}`
+  els.selTitle.innerHTML = row
+    ? `<span class="badge">${esc(row.info.short_name)}</span>${row.info.long_name ? ' ' + esc(row.info.long_name) : ''}`
     : 'All routes'
+  els.selClear.hidden = !row
   const notes = a.days.flatMap(d => d.notes.map(n => `${fmtDate(d.date)}: ${n}`))
   els.detail.hidden = false
   els.detail.innerHTML = `
-    <h2>${title}${row ? ' <button id="detail-all">Show all routes</button>' : ''}</h2>
+    <h2>${row ? `Route ${esc(row.info.short_name)} by hour and bucket` : 'All routes by hour and bucket'}</h2>
     <div class="detail-grid">
       <div class="chart">
         <h3>ETA accuracy by hour of departure</h3>
@@ -392,11 +473,10 @@ function renderDetail() {
         <h3>Accuracy by bucket · ${hourRange(h0, h1)}</h3>
         <div class="legend"><span style="--c:var(--s-early)">Too early</span><span style="--c:var(--s-accurate)">Accurate</span><span style="--c:var(--s-late)">Too late</span></div>
         <div class="stack">${BUCKETS.map((b, i) => stackRow(b.label, s, i)).join('')}</div>
-        <p class="hint">"Too early" means the bus left earlier than the window allows, the worst outcome for riders.</p>
+        <p class="hint">Minutes are measured from the predicted departure. "Too early" means the bus left earlier than the window allows, the worst outcome for riders. Hover or tap a segment for details.</p>
       </div>
     </div>
     ${notes.length ? `<h3>Data notes</h3><ul class="notes">${notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul>` : ''}`
-  $('detail-all')?.addEventListener('click', () => { state.selected = ''; renderTable(); renderDetail() })
   bindTooltips(els.detail)
 }
 
@@ -405,12 +485,28 @@ const accTip = (s: Summary, h: number) => `${hourLabel(h)}–${hourLabel(h + 1)}
 const compTip = (s: Summary, h: number) => `${hourLabel(h)}–${hourLabel(h + 1)}<br>${pct(s.completeness)} of ${int(s.scheduled)} trip-stops<br>`
   + `No vehicle: ${int(s.noVehicle)}<br>Vehicle, no ETA: ${int(s.vehicleNoPred)}<br>Canceled/skipped: ${int(s.communicated)}`
 
+const minutes = (sec: number) => `${(sec / 60).toFixed(1)} min`
+
 function stackRow(label: string, s: Summary, b: number) {
   const n = s.bucketN[b]
   if (!n) return `<span>${label}</span><div class="track"></div><span class="n">—</span>`
-  const e = s.bucketEarly[b] / n, ok = s.bucketOk[b] / n, l = s.bucketLate[b] / n
-  const seg = (x: number, c: string, name: string) => x > 0 ? `<i style="width:${x * 100}%;background:var(${c})" data-tip="${name}: ${pct(x)} of ${int(n)}"></i>` : ''
-  return `<span>${label}</span><div class="track">${seg(e, '--s-early', 'Too early')}${seg(ok, '--s-accurate', 'Accurate')}${seg(l, '--s-late', 'Too late')}</div><span class="n">${pct(ok, 0)}</span>`
+  const bk = BUCKETS[b]
+  const ne = s.bucketEarly[b], nl = s.bucketLate[b]
+  const e = ne / n, ok = s.bucketOk[b] / n, l = nl / n
+  const avgE = ne ? s.bucketEarlySec[b] / ne : NaN
+  const avgL = nl ? s.bucketLateSec[b] / nl : NaN
+  const tips = {
+    early: `<b>Too early: ${pct(e)}</b> of ${int(n)} predictions<br>On average the bus left <b>${minutes(avgE)} before</b> the predicted time<br>(allowed: up to ${minutes(bk.early)} early)`,
+    ok: `<b>Accurate: ${pct(ok)}</b> of ${int(n)} predictions<br>Within ${minutes(bk.early)} early to ${minutes(bk.late)} late`,
+    late: `<b>Too late: ${pct(l)}</b> of ${int(n)} predictions<br>On average the bus left <b>${minutes(avgL)} after</b> the predicted time<br>(allowed: up to ${minutes(bk.late)} late)`,
+  }
+  const seg = (x: number, c: string, tip: string) => x > 0 ? `<i style="width:${x * 100}%;background:var(${c})" data-tip="${esc(tip)}" tabindex="0"></i>` : ''
+  const sub = [
+    ne ? `<span>Early by <b>${minutes(avgE)}</b> avg</span>` : '',
+    nl ? `<span>late by <b>${minutes(avgL)}</b> avg</span>` : '',
+  ].filter(Boolean).join(' · ')
+  return `<span>${label}</span><div class="track">${seg(e, '--s-early', tips.early)}${seg(ok, '--s-accurate', tips.ok)}${seg(l, '--s-late', tips.late)}</div><span class="n">${pct(ok, 0)}</span>`
+    + (sub ? `<div class="sub">${sub}</div>` : '')
 }
 
 function barChart(data: { h: number; v: number; n: number; tip: string }[]) {
@@ -436,24 +532,26 @@ function barChart(data: { h: number; v: number; n: number; tip: string }[]) {
 
 function bindTooltips(root: HTMLElement) {
   root.querySelectorAll<SVGElement | HTMLElement>('[data-tip]').forEach(el => {
-    el.addEventListener('pointermove', ev => {
-      const e = ev as PointerEvent
-      els.tooltip.innerHTML = el.getAttribute('data-tip') ?? ''
-      els.tooltip.hidden = false
-      const r = els.tooltip.getBoundingClientRect()
-      let x = e.clientX + 12, yy = e.clientY + 12
-      if (x + r.width > window.innerWidth - 8) x = e.clientX - r.width - 12
-      if (yy + r.height > window.innerHeight - 8) yy = e.clientY - r.height - 12
-      els.tooltip.style.left = `${x}px`; els.tooltip.style.top = `${yy}px`
-    })
-    el.addEventListener('pointerleave', () => { els.tooltip.hidden = true })
+    const tip = () => el.getAttribute('data-tip') ?? ''
+    el.addEventListener('pointermove', ev => showTip(tip(), ev as PointerEvent))
+    el.addEventListener('pointerleave', hideTip)
+    // Tap / keyboard: show beside the element.
+    const at = () => { const r = el.getBoundingClientRect(); showTip(tip(), { clientX: r.left + r.width / 2, clientY: r.bottom }) }
+    el.addEventListener('click', at)
+    el.addEventListener('focus', at)
+    el.addEventListener('blur', hideTip)
   })
 }
 
 function downloadCsv() {
   const { a, rows } = sortedRows()
-  const header = ['route_id', ...COLS.map(c => c.label), 'days', 'hours']
-  const lines = [header, ...rows.map(r => [r.id, ...COLS.map(c => c.csv(r)), String(a.days.length), hourRange(a.h0, a.h1)])]
+  const extraHead = BUCKETS.flatMap(bk => [`${bk.label} too early %`, `${bk.label} avg min early`, `${bk.label} too late %`, `${bk.label} avg min late`])
+  const extra = (r: RouteRow) => BUCKETS.flatMap((_, i) => {
+    const n = r.s.bucketN[i], ne = r.s.bucketEarly[i], nl = r.s.bucketLate[i]
+    return [n ? fmtNum(ne / n) : '', ne ? (r.s.bucketEarlySec[i] / ne / 60).toFixed(2) : '', n ? fmtNum(nl / n) : '', nl ? (r.s.bucketLateSec[i] / nl / 60).toFixed(2) : '']
+  })
+  const header = ['route_id', ...COLS.map(c => c.label), ...extraHead, 'days', 'hours']
+  const lines = [header, ...rows.map(r => [r.id, ...COLS.map(c => c.csv(r)), ...extra(r), String(a.days.length), hourRange(a.h0, a.h1)])]
   const csv = lines.map(l => l.map(v => /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v).join(',')).join('\n')
   const link = document.createElement('a')
   link.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }))

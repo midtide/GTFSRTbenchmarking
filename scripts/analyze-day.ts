@@ -1,6 +1,6 @@
 import { analyzeDay } from '../src/engine/analyze.ts'
 import { fetchJson, KCM, type ScheduleVersion } from '../src/engine/archive.ts'
-import { addRollup, emptySummaryCounts, summarize } from '../src/engine/metrics.ts'
+import { addRollup, emptySummaryCounts, newRollup, summarize } from '../src/engine/metrics.ts'
 import { writeFileSync } from 'node:fs'
 
 const date = process.argv[2] ?? '2026-11-10'
@@ -17,7 +17,7 @@ const c = emptySummaryCounts()
 for (const id of res.rtRoutes) if (res.rollups[id]) addRollup(c, res.rollups[id], 0, 30)
 const s = summarize(c)
 console.log('system', { accuracy: s.accuracy, buckets: s.bucketAccuracy, n: s.bucketN, completeness: s.completeness, scheduled: s.scheduled, predicted: s.predicted, communicated: s.communicated, vehNoPred: s.vehicleNoPred, noVeh: s.noVehicle })
-const rows = res.rtRoutes.map(id => { const cc = emptySummaryCounts(); addRollup(cc, res.rollups[id] ?? new Int32Array(630), 0, 30); const ss = summarize(cc); return [res.routes[id].short_name, ss.accuracy, ss.completeness, ss.predictions, ss.scheduled] })
+const rows = res.rtRoutes.map(id => { const cc = emptySummaryCounts(); addRollup(cc, res.rollups[id] ?? newRollup(), 0, 30); const ss = summarize(cc); return [res.routes[id].short_name, ss.accuracy, ss.completeness, ss.predictions, ss.scheduled] })
 rows.sort((a, b) => (b[3] as number) - (a[3] as number))
 console.table(rows.slice(0, 12))
 writeFileSync(`day-${date}-${stride}.json`, JSON.stringify(res, (k, v) => v instanceof Int32Array ? Array.from(v) : v))
