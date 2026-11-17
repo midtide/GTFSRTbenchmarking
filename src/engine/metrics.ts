@@ -44,7 +44,7 @@ export const CELLS_PER_HOUR = COMP_OFFSET + COMP_CELLS // 29
 export const ROUTE_CELLS = HOURS * CELLS_PER_HOUR
 
 /** Bump when a calculation changes so cached day results are not reused. */
-export const METRIC_VERSION = 2
+export const METRIC_VERSION = 3
 
 export function accIndex(hour: number, bucket: number, cell: number): number {
   return hour * CELLS_PER_HOUR + bucket * ACC_STRIDE + cell
@@ -70,6 +70,14 @@ export interface RouteInfo {
  */
 export const STOP_FIELDS = 5
 export interface StopAccuracy { keys: string[]; data: Int32Array }
+
+/**
+ * Completeness by route and stop, sparse, same key scheme as StopAccuracy.
+ * data holds STOP_COMP_FIELDS ints per entry: key index * HOURS + hour,
+ * scheduled, complete (predicted or communicated), no vehicle.
+ * (vehicle but no 0–15 min ETA = scheduled - complete - no vehicle)
+ */
+export const STOP_COMP_FIELDS = 4
 export const stopKey = (routeId: string, stopId: string) => `${routeId}\u0001${stopId}`
 
 export interface DayResult {
@@ -86,6 +94,7 @@ export interface DayResult {
   rtRoutes: string[]
   routes: Record<string, RouteInfo>
   stopAcc: StopAccuracy
+  stopComp: StopAccuracy
   stats: {
     vpRows: number
     tuRows: number

@@ -166,3 +166,10 @@ code { font-size: 13px; background: var(--surface-2); padding: 0 4px; border-rad
 .stack .sub b { font-weight: 600; color: var(--text); }
 .stack .track i { cursor: pointer; }
 @media (max-width: 640px) { .map { height: 380px; } }
+
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; min-height: 34px; }
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button[aria-pressed="true"] { background: var(--accent); color: #fff; font-weight: 600; }
+.seg button[aria-pressed="true"]:hover { background: var(--accent-ink); }
+@media (max-width: 640px) { .seg { flex: 1; } .seg button { flex: 1; padding: 6px; font-size: 14px; } }

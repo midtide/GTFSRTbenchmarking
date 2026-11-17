@@ -68,9 +68,15 @@
       <div class="card" id="map-card">
         <div class="table-head">
           <h2 id="sel-title">All routes</h2>
-          <button id="sel-clear" hidden>Show all routes</button>
+          <div class="table-tools">
+            <div class="seg" role="group" aria-label="Map shows">
+              <button type="button" data-mode="accuracy" aria-pressed="true">ETA accuracy</button>
+              <button type="button" data-mode="completeness" aria-pressed="false">ETA completeness</button>
+            </div>
+            <button id="sel-clear" hidden>Show all routes</button>
+          </div>
         </div>
-        <p class="hint">Each stretch of route is colored by how accurate departure predictions were at the stop where it starts. Hover for details; click a route to select it.</p>
+        <p class="hint" id="map-hint"></p>
         <div id="map" class="map" role="region" aria-label="Map of prediction accuracy along routes"></div>
         <div class="legend map-legend" id="map-legend"></div>
         <p class="hint" id="map-note"></p>
@@ -113,6 +119,7 @@
         <p>The bucket chart also shows, for predictions outside the window, how far off they were on average: the mean of |actual − predicted| over the too-early predictions, and separately over the too-late ones.</p>
         <h3>Map</h3>
         <p>Route shapes come from the archived schedule (<code>shapes</code>, cut at each stop with <code>shape_dist_traveled</code>). Each stretch between two stops is colored by the share of accurate predictions for departures from the stop where it starts, pooled across the four buckets, because single stops rarely have enough predictions in every bucket for the four-bucket average. Stretches with fewer than 20 scored predictions are drawn dashed and uncolored. Where routes share a street, the lines overlap; select a route to see it alone. Basemap © OpenStreetMap contributors.</p>
+        <p>The completeness view colors the same stretches by the share of scheduled trip-stops at the starting stop that were complete, in the benchmark's rating tiers. It is shown by stop rather than by whole route because gaps are concentrated: on Nov 4 and Nov 10, 2026, the worst fifth of each route's stops held the large majority of its missing trip-stops, and the pattern repeated day to day (for example, one direction of a route missing from the feed entirely). Stretches with fewer than 10 scheduled trip-stops are drawn dashed and uncolored. Where opposite directions share a street, the worse one is drawn on top. A trip's final stop has no outgoing stretch, so it is not drawn, although it still counts in the completeness score.</p>
         <h3>ETA completeness</h3>
         <p>Follows the <a href="https://github.com/SwiftlyInc/ETA-Completeness-Benchmark" target="_blank" rel="noopener">ETA Completeness Benchmark</a>. Every scheduled trip-stop (from <code>stop_times</code>, for services active that day) is <b>complete</b> when either:</p>
         <ul>

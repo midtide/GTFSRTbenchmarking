@@ -3,8 +3,8 @@ import {
   emptySummaryCounts, summarize, type DayResult, type RouteInfo, type Summary,
 } from '../engine/metrics.ts'
 import type { FromWorker, ToWorker } from '../engine/protocol.ts'
-import { AccuracyMap, BANDS, MIN_SEGMENT_N, type StopStat } from './map.ts'
-import { STOP_FIELDS } from '../engine/metrics.ts'
+import { AccuracyMap, BANDS, COMP_BANDS, MIN_SEGMENT_N, MIN_SEGMENT_SCHEDULED, type MapMode, type StopCompStat, type StopStat } from './map.ts'
+import { STOP_COMP_FIELDS, STOP_FIELDS } from '../engine/metrics.ts'
 import { dateRange } from '../engine/time.ts'
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T
@@ -19,7 +19,8 @@ const els = {
   search: $<HTMLInputElement>('search'), csv: $<HTMLButtonElement>('csv'), detail: $('detail'),
   tooltip: $('tooltip'), clear: $<HTMLButtonElement>('clear-cache'), clearMsg: $('clear-msg'),
   mapEl: $('map'), mapCard: $('map-card'), mapLegend: $('map-legend'), mapNote: $('map-note'),
-  selTitle: $('sel-title'), selClear: $<HTMLButtonElement>('sel-clear'),
+  selTitle: $('sel-title'), selClear: $<HTMLButtonElement>('sel-clear'), mapHint: $('map-hint'),
+  modeButtons: [...document.querySelectorAll<HTMLButtonElement>('.seg button[data-mode]')],
 }
 
 // ---------------------------------------------------------------------------
@@ -41,6 +42,7 @@ const state = {
   map: null as AccuracyMap | null,
   geometryPending: '' as string,   // schedule digest requested
   geometryError: '' as string,
+  mapMode: 'accuracy' as MapMode,
 }
 
 const key = (stride: number, date: string) => `${stride}|${date}`
@@ -293,6 +295,12 @@ function selectRoute(id: string) {
   renderTable(); renderDetail(); renderMap()
 }
 els.selClear.addEventListener('click', () => selectRoute(''))
+for (const b of els.modeButtons) b.addEventListener('click', () => {
+  state.mapMode = b.dataset.mode as MapMode
+  try { localStorage.setItem('mapMode', state.mapMode) } catch { /* storage unavailable */ }
+  renderMap()
+})
+try { const m = localStorage.getItem('mapMode'); if (m === 'accuracy' || m === 'completeness') state.mapMode = m } catch { /* storage unavailable */ }
 
 function showTip(html: string, e: { clientX: number; clientY: number }) {
   els.tooltip.innerHTML = html
@@ -312,8 +320,6 @@ function ensureMap(): AccuracyMap {
       const tr = els.table.querySelector<HTMLElement>(`tbody tr[data-id="${CSS.escape(id)}"]`)
       tr?.scrollIntoView({ block: 'nearest' })
     }, { show: showTip, hide: hideTip })
-    els.mapLegend.innerHTML = BANDS.map(b => `<span style="--c:${b.color}">${b.label}</span>`).join('')
-      + `<span class="dash" style="--c:#9b9a94">fewer than ${MIN_SEGMENT_N} predictions</span>`
   }
   return state.map
 }
@@ -341,12 +347,32 @@ function renderMap() {
       st.n += data[i + 1]; st.ok += data[i + 2]; st.early += data[i + 3]; st.late += data[i + 4]
     }
   }
+  const comp = new Map<string, StopCompStat>()
+  for (const day of a.days) {
+    const { keys, data } = day.stopComp ?? { keys: [], data: new Int32Array() }
+    for (let i = 0; i < data.length; i += STOP_COMP_FIELDS) {
+      const h = data[i] % HOURS
+      if (h < a.h0 || h >= a.h1) continue
+      const k = keys[Math.floor(data[i] / HOURS)]
+      let st = comp.get(k)
+      if (!st) comp.set(k, (st = { scheduled: 0, complete: 0, noVehicle: 0 }))
+      st.scheduled += data[i + 1]; st.complete += data[i + 2]; st.noVehicle += data[i + 3]
+    }
+  }
   const names: Record<string, string> = {}
   for (const r of a.rows) names[r.id] = r.info.short_name || r.id
-  map.update(stats, new Set(a.rows.map(r => r.id)), state.selected, names)
+  const mode = state.mapMode
+  map.update(mode, stats, comp, new Set(a.rows.map(r => r.id)), state.selected, names)
+  for (const b of els.modeButtons) b.setAttribute('aria-pressed', String(b.dataset.mode === mode))
+  els.mapHint.textContent = mode === 'accuracy'
+    ? 'Each stretch of route is colored by how accurate departure predictions were at the stop where it starts. Hover for details; click a route to select it.'
+    : 'Each stretch of route is colored by the share of scheduled trip-stops at the stop where it starts that had a vehicle and a 0–15 minute ETA, or were canceled or skipped. Hover for details; click a route to select it.'
+  els.mapLegend.innerHTML = mode === 'accuracy'
+    ? BANDS.map(b => `<span style="--c:${b.color}">${b.label}</span>`).join('') + `<span class="dash" style="--c:#9b9a94">fewer than ${MIN_SEGMENT_N} predictions</span>`
+    : COMP_BANDS.map(b => `<span style="--c:${b.color}">${b.label}</span>`).join('') + `<span class="dash" style="--c:#9b9a94">fewer than ${MIN_SEGMENT_SCHEDULED} scheduled trip-stops</span>`
   els.mapNote.textContent = state.geometryError ? `Could not load route shapes: ${state.geometryError}`
     : state.geometryPending ? 'Loading route shapes…'
-    : `Pooled accuracy across all four buckets for ${hourRange(a.h0, a.h1)}. Shapes from the schedule in force on ${fmtDate(latest.date)}.`
+    : `${mode === 'accuracy' ? 'Pooled accuracy across all four buckets' : 'Completeness'} for ${hourRange(a.h0, a.h1)}. Worse stretches are drawn on top where lines overlap. Shapes from the schedule in force on ${fmtDate(latest.date)}.`
 }
 
 function renderTiles(a: ReturnType<typeof aggregate>) {

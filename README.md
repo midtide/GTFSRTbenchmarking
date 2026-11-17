@@ -12,7 +12,7 @@ The approach is modelled on [Transit Almanac](https://github.com/MisterClean/gtf
 ## What it shows
 
 - **Summary tiles** for the selected days and time of day.
-- **A system map** on OpenStreetMap. Every stretch of route between two stops is colored by how accurate departure predictions were at the stop where it starts (red = worse, blue = better). Hover for details; click a line or a table row to single out that route.
+- **A system map** on OpenStreetMap. Every stretch of route between two stops is colored by how accurate departure predictions were at the stop where it starts (red = worse, blue = better). Hover for details; click a line or a table row to single out that route. A toggle switches the map to **completeness**, coloring the same stretches by the share of scheduled trip-stops that were complete, in the benchmark's rating tiers. Completeness is shown by stop, not whole route, because gaps cluster: whole directions or branches can be missing from the feed while the rest of the route is fine.
 - **Hour-by-hour charts** of accuracy and completeness, and a **bucket chart** splitting each bucket into too early / accurate / too late, with the average minutes off for the early and late predictions.
 - **A route table** with both benchmarks, sortable and downloadable as CSV (including per-bucket early/late shares and average minutes off).
 
@@ -68,7 +68,7 @@ For each service day:
 1. **Schedule.** Uses the archived GTFS version in force (the latest one captured by the end of that day), with the trip-stops scheduled for active services.
 2. **Actual departures.** Reads every vehicle-positions poll in the day's window. A trip has departed stop *s* when its vehicle is first reported with `current_stop_sequence > s`. The departure time is the midpoint between that report and the one before it, kept only when the two are ≤ 2 minutes apart.
 3. **Predictions.** Reads trip-update polls at the chosen sampling rate (default one every 2 minutes, out of one every ~20 s). Each prediction's `departure_time` is compared with the actual departure, bucketed by time from `feed_timestamp` to actual. The same rows mark 0–15 minute predictions, `CANCELED` trips, `SKIPPED` stops and vehicle assignment for completeness.
-4. **Map data.** Each scored prediction is also counted by route, stop (where the departure was predicted) and hour. The map colors each stop-to-stop piece of route shape by the pooled accuracy at its starting stop; pieces with fewer than 20 predictions are left uncolored.
+4. **Map data.** Each scored prediction, and each scheduled trip-stop's completeness outcome, is also counted by route, stop and hour. The map colors each stop-to-stop piece of route shape by the pooled accuracy at its starting stop; pieces with fewer than 20 predictions are left uncolored.
 5. **Rollup.** Results are additive counts by route and service hour (0–29). The UI sums them for any date range and time window, and rates are always computed from summed counts.
 
 ### Why these choices

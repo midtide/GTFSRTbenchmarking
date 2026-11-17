@@ -6,8 +6,22 @@ import 'leaflet/dist/leaflet.css'
 import type { Geometry } from '../engine/geometry.ts'
 
 export interface StopStat { n: number; ok: number; early: number; late: number }
+export interface StopCompStat { scheduled: number; complete: number; noVehicle: number }
+export type MapMode = 'accuracy' | 'completeness'
 
 export const MIN_SEGMENT_N = 20
+export const MIN_SEGMENT_SCHEDULED = 10
+
+/** Completeness bands follow the benchmark's rating tiers (status colors). */
+export const COMP_BANDS = [
+  { min: 0.95, label: 'Best in class (95% +)', color: '#0ca30c' },
+  { min: 0.90, label: 'Good (90–95%)', color: '#fab219' },
+  { min: 0.85, label: 'Fair (85–90%)', color: '#ec835a' },
+  { min: 0, label: 'Needs improvement (under 85%)', color: '#d03b3b' },
+]
+export function compColor(x: number): string {
+  return (COMP_BANDS.find(b => x >= b.min) ?? COMP_BANDS[COMP_BANDS.length - 1]).color
+}
 
 /** Accuracy bands: diverging red (worse) to blue (better) around a neutral middle. */
 export const BANDS = [
@@ -32,6 +46,8 @@ export class AccuracyMap {
   private geometry: Geometry | null = null
   private selected = ''
   private stats = new Map<string, StopStat>()
+  private compStats = new Map<string, StopCompStat>()
+  private mode: MapMode = 'accuracy'
   private routeNames: Record<string, string> = {}
   private visibleRoutes = new Set<string>()
   private lastFit = ''
@@ -86,8 +102,10 @@ export class AccuracyMap {
     this.restyle()
   }
 
-  update(stats: Map<string, StopStat>, visibleRoutes: Set<string>, selected: string, routeNames: Record<string, string>) {
+  update(mode: MapMode, stats: Map<string, StopStat>, compStats: Map<string, StopCompStat>, visibleRoutes: Set<string>, selected: string, routeNames: Record<string, string>) {
+    this.mode = mode
     this.stats = stats
+    this.compStats = compStats
     this.visibleRoutes = visibleRoutes
     this.selected = selected
     this.routeNames = routeNames
@@ -99,23 +117,25 @@ export class AccuracyMap {
   private restyle() {
     if (!this.geometry) return
     const sel = this.selected
-    const front: Piece[] = []
+    // Colored pieces, drawn worst-last so problems sit on top where lines overlap
+    // (opposite directions often share a street).
+    const ranked: { p: Piece; score: number }[] = []
     for (const p of this.pieces) {
       const visible = this.visibleRoutes.has(p.route)
       const onMap = this.group.hasLayer(p.line)
       if (!visible) { if (onMap) this.group.removeLayer(p.line); continue }
       if (!onMap) this.group.addLayer(p.line)
-      const st = this.stats.get(`${p.route}\u0001${p.from}`)
-      const enough = !!st && st.n >= MIN_SEGMENT_N
-      const color = enough ? bandColor(st!.ok / st!.n) : NO_DATA
+      const { score, color } = this.scoreOf(p)
+      const enough = !Number.isNaN(score)
       if (sel && p.route !== sel) {
         p.line.setStyle({ color: NO_DATA, weight: 1.5, opacity: 0.35, dashArray: undefined })
       } else {
         p.line.setStyle({ color, weight: sel ? 6 : enough ? 3 : 1.5, opacity: enough ? 0.95 : 0.7, dashArray: enough ? undefined : '3 4' })
-        if (sel) front.push(p)
+        if (enough) ranked.push({ p, score: sel ? score - 10 : score }) // keep the selection above the rest
       }
     }
-    for (const p of front) p.line.bringToFront()
+    ranked.sort((a, b) => b.score - a.score)
+    for (const { p } of ranked) p.line.bringToFront()
     const fitKey = `${sel}|${this.visibleRoutes.size}`
     if (fitKey !== this.lastFit) {
       this.lastFit = fitKey
@@ -128,15 +148,39 @@ export class AccuracyMap {
     }
   }
 
+  private scoreOf(p: Piece): { score: number; color: string } {
+    const k = `${p.route}\u0001${p.from}`
+    if (this.mode === 'completeness') {
+      const c = this.compStats.get(k)
+      if (!c || c.scheduled < MIN_SEGMENT_SCHEDULED) return { score: NaN, color: NO_DATA }
+      const x = c.complete / c.scheduled
+      return { score: x, color: compColor(x) }
+    }
+    const st = this.stats.get(k)
+    if (!st || st.n < MIN_SEGMENT_N) return { score: NaN, color: NO_DATA }
+    const x = st.ok / st.n
+    return { score: x, color: bandColor(x) }
+  }
+
   private tipHtml(p: Piece) {
     const esc = (s: string) => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!))
     const name = esc(this.routeNames[p.route] ?? p.route)
     const stop = esc(this.geometry?.stopNames[p.from] ?? p.from)
     const st = this.stats.get(`${p.route}\u0001${p.from}`)
     const pct = (x: number) => `${Math.round(x * 100)}%`
+    const sel = p.route === this.selected ? '' : '<br><i>Click to select route</i>'
+    if (this.mode === 'completeness') {
+      const c = this.compStats.get(`${p.route}\u0001${p.from}`)
+      const int = (x: number) => x.toLocaleString('en-US')
+      const cb = !c ? 'No scheduled trip-stops in this window'
+        : `${(c.complete / c.scheduled * 100).toFixed(1)}% complete · ${int(c.scheduled)} scheduled trip-stops`
+          + `<br>No vehicle: ${int(c.noVehicle)} · Vehicle, no ETA: ${int(c.scheduled - c.complete - c.noVehicle)}`
+          + (c.scheduled < MIN_SEGMENT_SCHEDULED ? '<br><i>Too few to color</i>' : '')
+      return `<b>Route ${name}</b><br>Departing ${stop}<br>${cb}${sel}`
+    }
     const body = !st ? 'No scored predictions'
       : `${pct(st.ok / st.n)} accurate · ${st.n.toLocaleString('en-US')} predictions<br>${pct(st.early / st.n)} too early · ${pct(st.late / st.n)} too late`
         + (st.n < MIN_SEGMENT_N ? '<br><i>Too few to color</i>' : '')
-    return `<b>Route ${name}</b><br>Departing ${stop}<br>${body}${p.route === this.selected ? '' : '<br><i>Click to select route</i>'}`
+    return `<b>Route ${name}</b><br>Departing ${stop}<br>${body}${sel}`
   }
 }
