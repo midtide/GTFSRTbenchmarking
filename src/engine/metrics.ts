@@ -44,7 +44,7 @@ export const CELLS_PER_HOUR = COMP_OFFSET + COMP_CELLS // 29
 export const ROUTE_CELLS = HOURS * CELLS_PER_HOUR
 
 /** Bump when a calculation changes so cached day results are not reused. */
-export const METRIC_VERSION = 3
+export const METRIC_VERSION = 4
 
 export function accIndex(hour: number, bucket: number, cell: number): number {
   return hour * CELLS_PER_HOUR + bucket * ACC_STRIDE + cell
@@ -80,6 +80,41 @@ export interface StopAccuracy { keys: string[]; data: Int32Array }
 export const STOP_COMP_FIELDS = 4
 export const stopKey = (routeId: string, stopId: string) => `${routeId}\u0001${stopId}`
 
+/** A trip whose share of complete trip-stops was below TRIP_ISSUE_THRESHOLD. */
+export const TRIP_ISSUE_THRESHOLD = 0.95
+export interface TripIssue {
+  trip: string
+  route: string
+  dir: string
+  headsign: string
+  block: string
+  /** first scheduled departure, seconds since service-day base */
+  start: number
+  /** vehicle ids seen on the trip, most-seen first (empty when none) */
+  vehicles: string[]
+  scheduled: number
+  complete: number
+  noVehicle: number
+  noEta: number
+  /** where the incomplete trip-stops were along the trip */
+  where: 'all' | 'start' | 'end' | 'middle' | 'scattered'
+}
+
+/**
+ * Per-vehicle completeness, sparse by hour of scheduled departure. Only
+ * outcomes a vehicle can affect are counted: trip-stops on trips it was
+ * assigned to (complete, or vehicle but no 0–15 min ETA).
+ * data: VEH_FIELDS ints per entry: vehicle index * HOURS + hour, scheduled,
+ * complete, trips (by start hour), trips below the threshold.
+ */
+export const VEH_FIELDS = 5
+export interface VehicleStats {
+  ids: string[]
+  labels: string[]
+  routes: string[][]
+  data: Int32Array
+}
+
 export interface DayResult {
   date: string
   version: number
@@ -95,6 +130,8 @@ export interface DayResult {
   routes: Record<string, RouteInfo>
   stopAcc: StopAccuracy
   stopComp: StopAccuracy
+  tripIssues: TripIssue[]
+  vehicles: VehicleStats
   stats: {
     vpRows: number
     tuRows: number

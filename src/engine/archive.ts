@@ -22,7 +22,7 @@ export type FeedType = 'trip_updates' | 'vehicle_positions'
 export const COLUMNS: Record<FeedType, string[]> = {
   trip_updates: ['feed_timestamp', 'trip_id', 'start_date', 'schedule_relationship', 'vehicle_id',
     'stop_sequence', 'departure_time', 'stop_schedule_relationship'],
-  vehicle_positions: ['trip_id', 'start_date', 'current_stop_sequence', 'current_status', 'timestamp'],
+  vehicle_positions: ['trip_id', 'start_date', 'current_stop_sequence', 'current_status', 'timestamp', 'vehicle_id', 'vehicle_label'],
 }
 
 /** Bytes moved over the network by this module (for progress display). */
@@ -108,7 +108,7 @@ export interface FileIndex {
   times: Float64Array
 }
 
-const INDEX_VERSION = 2
+const INDEX_VERSION = 3
 const memIndex = new Map<string, Promise<FileIndex | null>>()
 
 export function getFileIndex(feed: FeedType, utcDate: string): Promise<FileIndex | null> {
@@ -208,6 +208,7 @@ async function prefetchedBuffer(index: FileIndex, rowGroups: RowGroup[], gap: nu
   for (const [s, e] of ranges) {
     const last = spans[spans.length - 1]
     if (last && s - last[1] <= gap && e - last[0] <= MAX_SPAN) last[1] = Math.max(last[1], e)
+    else if (last && s - last[1] <= gap) spans.push([last[1], e]) // split, but keep the bytes in between
     else spans.push([s, e])
   }
   const buffers = await Promise.all(spans.map(async ([s, e]) => {
@@ -226,8 +227,19 @@ async function prefetchedBuffer(index: FileIndex, rowGroups: RowGroup[], gap: nu
       let lo = 0, hi = spans.length - 1
       while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (spans[mid][0] <= start) lo = mid; else hi = mid - 1 }
       const [s, e] = spans[lo]
-      if (start < s || stop > e) throw new Error('Read outside prefetched ranges')
-      return buffers[lo].slice(start - s, stop - s)
+      if (start < s) throw new Error('Read outside prefetched ranges')
+      if (stop <= e) return buffers[lo].slice(start - s, stop - s)
+      // The read crosses into following spans: they must be contiguous.
+      const out = new Uint8Array(stop - start)
+      let pos = start, k = lo
+      while (pos < stop) {
+        if (k >= spans.length || spans[k][0] > pos) throw new Error('Read outside prefetched ranges')
+        const [ks, ke] = spans[k]
+        const end = Math.min(stop, ke)
+        out.set(new Uint8Array(buffers[k], pos - ks, end - pos), pos - start)
+        pos = end; k++
+      }
+      return out.buffer
     },
   }
 }

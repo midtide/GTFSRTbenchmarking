@@ -5,6 +5,10 @@ import {
 import type { FromWorker, ToWorker } from '../engine/protocol.ts'
 import { AccuracyMap, BANDS, COMP_BANDS, MIN_SEGMENT_N, MIN_SEGMENT_SCHEDULED, type MapMode, type StopCompStat, type StopStat } from './map.ts'
 import { STOP_COMP_FIELDS, STOP_FIELDS } from '../engine/metrics.ts'
+import {
+  coachLabels, coachName, coachRows, filterLabel, issuesIn, matchesFilter, recurring, recurringHtml, saveCsv,
+  THRESHOLD_LABEL, toCsv, tripTable, tripsCsv, type CoachRow, type DatedIssue, type Fmt,
+} from './issues.ts'
 import { dateRange } from '../engine/time.ts'
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T
@@ -21,6 +25,9 @@ const els = {
   mapEl: $('map'), mapCard: $('map-card'), mapLegend: $('map-legend'), mapNote: $('map-note'),
   selTitle: $('sel-title'), selClear: $<HTMLButtonElement>('sel-clear'), mapHint: $('map-hint'),
   modeButtons: [...document.querySelectorAll<HTMLButtonElement>('.seg button[data-mode]')],
+  tabButtons: [...document.querySelectorAll<HTMLButtonElement>('.tabs button[data-tab]')],
+  coachAll: $<HTMLInputElement>('coach-all'), coachAllWrap: $('coach-all-wrap'),
+  tableScroll: document.querySelector<HTMLElement>('.table-scroll')!,
 }
 
 // ---------------------------------------------------------------------------
@@ -43,6 +50,12 @@ const state = {
   geometryPending: '' as string,   // schedule digest requested
   geometryError: '' as string,
   mapMode: 'accuracy' as MapMode,
+  tab: 'routes' as 'routes' | 'coaches',
+  expanded: new Set<string>(),          // 'route:ID' | 'coach:ID'
+  filters: new Map<string, string>(),   // panel scope -> 'trip:..' | 'block:..' | 'coach:..'
+  tripsOpen: new Set<string>(),         // panel scopes showing the full trip list
+  showAll: new Set<string>(),           // panel scopes past the row cap
+  coachSort: { key: 'days', dir: -1 },
 }
 
 const key = (stride: number, date: string) => `${stride}|${date}`
@@ -415,7 +428,7 @@ const naturalRoute = (r: RouteRow) => r.info.short_name.replace(/\d+/g, m => m.p
 
 const COLS: Col[] = [
   { key: 'route', label: 'Route', get: naturalRoute, csv: r => r.info.short_name,
-    cell: r => `<td><span class="route-name"><span class="badge">${esc(r.info.short_name || r.id)}</span><span class="long">${esc(r.info.long_name)}</span></span></td>` },
+    cell: r => `<td><span class="route-name">${expButton('route', r.id, `incomplete trips on route ${r.info.short_name}`)}<span class="badge">${esc(r.info.short_name || r.id)}</span><span class="long">${esc(r.info.long_name)}</span></span></td>` },
   { key: 'acc', label: 'Accuracy', get: r => r.s.accuracy, cell: r => barCell(r.s.accuracy), csv: r => fmtNum(r.s.accuracy) },
   ...BUCKETS.map((b, i): Col => ({ key: `b${i}`, label: b.label, get: r => (r.s.bucketN[i] < MIN_BUCKET_N ? NaN : r.s.bucketAccuracy[i]), cell: r => bucketCell(r, i), csv: r => fmtNum(r.s.bucketAccuracy[i]) })),
   { key: 'n', label: 'Predictions', get: r => r.s.predictions, cell: r => `<td>${int(r.s.predictions)}</td>`, csv: r => String(r.s.predictions) },
@@ -444,7 +457,24 @@ function sortedRows() {
   return { a, rows }
 }
 
+const F: Fmt = { esc, int, pct, fmtDate }
+
+function expButton(kind: string, id: string, what: string) {
+  const open = state.expanded.has(`${kind}:${id}`)
+  return `<button class="exp" data-action="expand" data-scope="${esc(kind + ':' + id)}" aria-expanded="${open}" aria-label="${open ? 'Hide' : 'Show'} ${esc(what)}" title="${open ? 'Hide' : 'Show'} ${esc(what)}">${open ? '▾' : '▸'}</button>`
+}
+
+function setPanelWidth() {
+  els.tableScroll.style.setProperty('--panel-w', `${els.tableScroll.clientWidth}px`)
+}
+window.addEventListener('resize', setPanelWidth)
+
 function renderTable() {
+  setPanelWidth()
+  for (const b of els.tabButtons) b.setAttribute('aria-selected', String(b.dataset.tab === state.tab))
+  els.coachAllWrap.hidden = state.tab !== 'coaches'
+  els.search.placeholder = state.tab === 'coaches' ? 'Filter coaches or routes' : 'Filter routes'
+  if (state.tab === 'coaches') return renderCoachTable()
   const { a, rows } = sortedRows()
   const head = els.table.tHead!
   head.innerHTML = `<tr><th></th><th class="group" colspan="6">ETA accuracy</th><th class="group" colspan="5">ETA completeness</th></tr>
@@ -454,15 +484,158 @@ function renderTable() {
     state.sort = { key: k, dir: state.sort.key === k ? -state.sort.dir : k === 'route' ? 1 : -1 }
     renderTable()
   }))
-  const body = els.table.tBodies[0]
-  body.innerHTML = rows.map(r => `<tr data-id="${esc(r.id)}" class="${r.id === state.selected ? 'sel' : ''}">${COLS.map(c => c.cell(r)).join('')}</tr>`).join('')
-  body.querySelectorAll<HTMLTableRowElement>('tr').forEach(tr => tr.addEventListener('click', () => {
-    state.selected = state.selected === tr.dataset.id ? '' : tr.dataset.id!
-    selectRoute(state.selected)
-    if (state.selected && els.mapCard.getBoundingClientRect().top < 0) els.mapCard.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  }))
-  els.tableNote.textContent = `Bucket figures need at least ${MIN_BUCKET_N} predictions; overall accuracy needs all four buckets. Click a route for its hour-by-hour profile.`
+  const routeNames = routeNameMap(a)
+  els.table.tBodies[0].innerHTML = rows.map(r => {
+    const main = `<tr data-id="${esc(r.id)}" class="${r.id === state.selected ? 'sel' : ''}">${COLS.map(c => c.cell(r)).join('')}</tr>`
+    return state.expanded.has(`route:${r.id}`)
+      ? main + `<tr class="panel-row"><td colspan="${COLS.length}">${routePanel(r, a, routeNames)}</td></tr>`
+      : main
+  }).join('')
+  els.tableNote.textContent = `Bucket figures need at least ${MIN_BUCKET_N} predictions; overall accuracy needs all four buckets. Click a route to show it on the map; click ▸ for its incomplete trips.`
     + (a.scheduleOnly ? ` ${a.scheduleOnly} scheduled route${a.scheduleOnly > 1 ? 's' : ''} that never appear in KCM's realtime feed are left out.` : '')
+}
+
+const routeNameMap = (a: ReturnType<typeof aggregate>) => {
+  const m: Record<string, string> = {}
+  for (const r of a.rows) m[r.id] = r.info.short_name || r.id
+  return m
+}
+
+/** Trip list section shared by route and coach panels. */
+function tripSection(scope: string, list: DatedIssue[], multiDay: boolean, labels: Map<string, string>, routeNames: Record<string, string>, showRoute: boolean) {
+  const filter = state.filters.get(scope) ?? ''
+  const shown = list.filter(x => matchesFilter(x, filter))
+  const open = !multiDay || state.tripsOpen.has(scope) || !!filter
+  const chip = filter ? `<span class="chip">Showing ${filterLabel(filter, list, labels, F)} <button data-action="filter" data-scope="${esc(scope)}" data-filter="" aria-label="Clear filter">×</button></span>` : ''
+  if (!open) {
+    return `<button class="link" data-action="trips" data-scope="${esc(scope)}">Show all ${int(list.length)} incomplete trips</button>`
+  }
+  return `<h4>All incomplete trips (${int(shown.length)})</h4>${chip}
+    ${multiDay && !filter ? `<button class="link" data-action="trips" data-scope="${esc(scope)}">Hide trip list</button>` : ''}
+    ${tripTable(shown, { showRoute, showAll: state.showAll.has(scope), labels, routeNames, f: F, scope })}`
+}
+
+function routePanel(r: RouteRow, a: ReturnType<typeof aggregate>, routeNames: Record<string, string>) {
+  const scope = `route:${r.id}`
+  const labels = coachLabels(a.days)
+  const list = issuesIn(a.days, a.h0, a.h1, x => x.route === r.id)
+  const multiDay = a.days.length > 1
+  const nv = list.filter(x => !x.vehicles.length).length
+  const daysWith = new Set(list.map(x => x.date)).size
+  const head = `<div class="panel-head"><b>Route ${esc(r.info.short_name)}: trips under ${THRESHOLD_LABEL} complete</b>
+    ${list.length ? `<button data-action="csv" data-scope="${esc(scope)}">Download trips CSV</button>` : ''}</div>`
+  if (!list.length) return `<div class="panel">${head}<p>No trips below ${THRESHOLD_LABEL} in the selected days and time of day.</p></div>`
+  const summary = `<p>${int(list.length)} trip${list.length > 1 ? 's' : ''} on ${daysWith} of ${a.days.length} day${a.days.length > 1 ? 's' : ''} · ${int(nv)} never had a vehicle · ${int(list.length - nv)} had a vehicle but missed 0–15 minute ETAs at some stops</p>`
+  const rec = multiDay ? `<h4>Recurring on 2 or more days</h4>${recurringHtml(recurring(list, labels, F), state.filters.get(scope) ?? '', scope, F)}` : ''
+  return `<div class="panel">${head}${summary}${rec}${tripSection(scope, list, multiDay, labels, routeNames, false)}</div>`
+}
+
+// --- Coaches tab --------------------------------------------------------------
+
+type CoachCol = { key: string; label: string; get: (c: CoachRow) => number | string; cell: (c: CoachRow, labels: Map<string, string>, names: Record<string, string>) => string; csv: (c: CoachRow, names: Record<string, string>) => string }
+const routeList = (c: CoachRow, names: Record<string, string>) => [...c.routes].map(r => names[r] ?? r).sort((x, y) => x.localeCompare(y, 'en', { numeric: true }))
+const COACH_COLS: CoachCol[] = [
+  { key: 'coach', label: 'Coach', get: c => c.label.padStart(8, '0'), csv: c => c.label,
+    cell: c => `<td><span class="route-name">${expButton('coach', c.id, `incomplete trips for coach ${c.label}`)}<span class="badge">${esc(c.label)}</span>${c.label !== c.id ? `<span class="long">id ${esc(c.id)}</span>` : ''}</span></td>` },
+  { key: 'rate', label: 'Completeness', get: c => c.rate, cell: c => barCell(c.rate), csv: c => fmtNum(c.rate) },
+  { key: 'sched', label: 'Trip-stops', get: c => c.scheduled, cell: c => `<td>${int(c.scheduled)}</td>`, csv: c => String(c.scheduled) },
+  { key: 'noeta', label: 'Without ETA', get: c => c.scheduled - c.complete, cell: c => `<td>${int(c.scheduled - c.complete)}</td>`, csv: c => String(c.scheduled - c.complete) },
+  { key: 'trips', label: 'Trips', get: c => c.trips, cell: c => `<td>${int(c.trips)}</td>`, csv: c => String(c.trips) },
+  { key: 'itrips', label: `Trips under ${THRESHOLD_LABEL}`, get: c => c.issueTrips, cell: c => `<td>${int(c.issueTrips)}</td>`, csv: c => String(c.issueTrips) },
+  { key: 'days', label: `Days under ${THRESHOLD_LABEL}`, get: c => c.daysBelow * 1000 - c.rate, cell: c => `<td>${c.daysBelow} <span class="muted">of ${c.daysActive}</span></td>`, csv: c => `${c.daysBelow}/${c.daysActive}` },
+  { key: 'routes', label: 'Routes', get: c => c.routes.size, csv: (c, n) => routeList(c, n).join(' '),
+    cell: (c, _l, n) => { const rs = routeList(c, n); return `<td class="long" title="${esc(rs.join(', '))}">${esc(rs.slice(0, 6).join(', '))}${rs.length > 6 ? ` +${rs.length - 6}` : ''}</td>` } },
+]
+
+function coachData() {
+  const a = aggregate()
+  const all = coachRows(a.days, a.h0, a.h1)
+  const names = routeNameMap(a)
+  const q = els.search.value.trim().toLowerCase()
+  const col = COACH_COLS.find(c => c.key === state.coachSort.key) ?? COACH_COLS[0]
+  const rows = all
+    .filter(c => els.coachAll.checked || c.rate < 0.95)
+    .filter(c => !q || `${c.label} ${c.id} ${routeList(c, names).join(' ')}`.toLowerCase().includes(q))
+    .sort((x, y) => { const u = col.get(x), v = col.get(y); return (u < v ? -1 : u > v ? 1 : 0) * state.coachSort.dir })
+  return { a, all, rows, names }
+}
+
+function renderCoachTable() {
+  const { a, all, rows, names } = coachData()
+  const labels = coachLabels(a.days)
+  els.table.tHead!.innerHTML = `<tr>${COACH_COLS.map(c => `<th class="sortable" data-key="${c.key}" aria-sort="${state.coachSort.key === c.key ? (state.coachSort.dir > 0 ? 'ascending' : 'descending') : 'none'}">${c.label}</th>`).join('')}</tr>`
+  els.table.tHead!.querySelectorAll<HTMLElement>('th.sortable').forEach(th => th.addEventListener('click', () => {
+    const k = th.dataset.key!
+    state.coachSort = { key: k, dir: state.coachSort.key === k ? -state.coachSort.dir : k === 'coach' || k === 'rate' ? 1 : -1 }
+    renderTable()
+  }))
+  els.table.tBodies[0].innerHTML = rows.map(c => {
+    const main = `<tr class="coach-row">${COACH_COLS.map(col => col.cell(c, labels, names)).join('')}</tr>`
+    return state.expanded.has(`coach:${c.id}`)
+      ? main + `<tr class="panel-row"><td colspan="${COACH_COLS.length}">${coachPanel(c, a, labels, names)}</td></tr>`
+      : main
+  }).join('') || `<tr><td colspan="${COACH_COLS.length}" class="muted">No coaches below ${THRESHOLD_LABEL} in the selected days and time of day.</td></tr>`
+  const below = all.filter(c => c.rate < 0.95).length
+  els.tableNote.textContent = `${below} of ${all.length} coaches were below ${THRESHOLD_LABEL} complete${els.coachAll.checked ? '' : ' (shown)'}. Counts only trips each coach was assigned to; trips that never had a vehicle are listed under their route. Click ▸ for a coach's incomplete trips.`
+}
+
+function coachPanel(c: CoachRow, a: ReturnType<typeof aggregate>, labels: Map<string, string>, names: Record<string, string>) {
+  const scope = `coach:${c.id}`
+  const list = issuesIn(a.days, a.h0, a.h1, x => x.vehicles.includes(c.id))
+  const days = c.perDay.sort((x, y) => x.date.localeCompare(y.date))
+    .map(d => `<span class="day-chip ${d.rate < 0.95 ? 'below' : ''}">${fmtDate(d.date)} <b>${pct(d.rate)}</b></span>`).join('')
+  return `<div class="panel"><div class="panel-head"><b>Coach ${esc(coachName(c.id, labels))}: trips under ${THRESHOLD_LABEL} complete involving this coach</b>
+      ${list.length ? `<button data-action="csv" data-scope="${esc(scope)}">Download trips CSV</button>` : ''}</div>
+    <p>Includes trips this coach shared with another vehicle; the table's trip counts use only trips where it was the main vehicle.</p>
+    <p>Completeness by day:</p><div class="days-row">${days}</div>
+    ${list.length ? tripSection(scope, list, false, labels, names, true) : `<p>No trips below ${THRESHOLD_LABEL}.</p>`}</div>`
+}
+
+// --- Table events (delegated, so they survive re-rendering) --------------------
+
+els.table.tBodies[0].addEventListener('click', ev => {
+  const t = ev.target as HTMLElement
+  const btn = t.closest<HTMLElement>('[data-action]')
+  if (btn) {
+    ev.stopPropagation()
+    const scope = btn.dataset.scope ?? ''
+    const toggle = (set: Set<string>) => { if (set.has(scope)) set.delete(scope); else set.add(scope) }
+    switch (btn.dataset.action) {
+      case 'expand': toggle(state.expanded); break
+      case 'trips': toggle(state.tripsOpen); break
+      case 'showall': state.showAll.add(scope); break
+      case 'filter': {
+        const f = btn.dataset.filter ?? ''
+        if (!f || state.filters.get(scope) === f) state.filters.delete(scope)
+        else state.filters.set(scope, f)
+        break
+      }
+      case 'csv': return downloadTripsCsv(scope)
+    }
+    renderTable()
+    return
+  }
+  if (t.closest('.panel-row')) return
+  const tr = t.closest<HTMLTableRowElement>('tr[data-id]')
+  if (!tr || state.tab !== 'routes') return
+  state.selected = state.selected === tr.dataset.id ? '' : tr.dataset.id!
+  selectRoute(state.selected)
+  if (state.selected && els.mapCard.getBoundingClientRect().top < 0) els.mapCard.scrollIntoView({ behavior: 'smooth', block: 'start' })
+})
+
+for (const b of els.tabButtons) b.addEventListener('click', () => { state.tab = b.dataset.tab as 'routes' | 'coaches'; renderTable() })
+els.coachAll.addEventListener('change', renderTable)
+
+function downloadTripsCsv(scope: string) {
+  const a = aggregate()
+  const labels = coachLabels(a.days)
+  const id = scope.slice(scope.indexOf(':') + 1)
+  const list = scope.startsWith('route:')
+    ? issuesIn(a.days, a.h0, a.h1, x => x.route === id)
+    : issuesIn(a.days, a.h0, a.h1, x => x.vehicles.includes(id))
+  const names = routeNameMap(a)
+  const who = scope.startsWith('route:') ? `route-${names[id] ?? id}` : `coach-${labels.get(id) ?? id}`
+  saveCsv(tripsCsv(list, labels, names), `kcm-incomplete-trips_${who}_${els.from.value}_${els.to.value}.csv`.replace(/\s+/g, '-'))
 }
 
 function renderDetail() {
@@ -570,6 +743,12 @@ function bindTooltips(root: HTMLElement) {
 }
 
 function downloadCsv() {
+  if (state.tab === 'coaches') {
+    const { rows, names } = coachData()
+    const lines = [['vehicle_id', ...COACH_COLS.map(c => c.label)], ...rows.map(c => [c.id, ...COACH_COLS.map(col => col.csv(c, names))])]
+    saveCsv(toCsv(lines), `kcm-coach-completeness_${els.from.value}_${els.to.value}.csv`)
+    return
+  }
   const { a, rows } = sortedRows()
   const extraHead = BUCKETS.flatMap(bk => [`${bk.label} too early %`, `${bk.label} avg min early`, `${bk.label} too late %`, `${bk.label} avg min late`])
   const extra = (r: RouteRow) => BUCKETS.flatMap((_, i) => {

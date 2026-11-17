@@ -15,6 +15,10 @@ export interface CompiledSchedule {
   tripRoute: Int32Array          // trip -> route index
   tripService: string[]          // trip -> service_id
   tripShape: string[]            // trip -> shape_id
+  tripIds: string[]
+  tripBlock: string[]
+  tripDir: string[]
+  tripHeadsign: string[]
   /** stop times grouped by trip: tripStart[t]..tripStart[t+1] */
   tripStart: Int32Array
   stSeq: Int32Array
@@ -94,7 +98,7 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
   const digest = v._feed_digest
   const [routesRows, tripsRows, calRows, cdRows, st] = await Promise.all([
     readObjects(digest, 'routes'),
-    readObjects(digest, 'trips', ['route_id', 'service_id', 'trip_id', 'shape_id']),
+    readObjects(digest, 'trips', ['route_id', 'service_id', 'trip_id', 'shape_id', 'block_id', 'direction_id', 'trip_headsign']),
     readObjects(digest, 'calendar'),
     readObjects(digest, 'calendar_dates'),
     readColumns(digest, 'stop_times', ['trip_id', 'stop_sequence', 'arrival_time', 'departure_time', 'stop_id', 'shape_dist_traveled']),
@@ -118,6 +122,7 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
   const tripRouteArr: number[] = []
   const tripService: string[] = []
   const tripShape: string[] = []
+  const tripIds: string[] = [], tripBlock: string[] = [], tripDir: string[] = [], tripHeadsign: string[] = []
   for (const t of tripsRows) {
     const id = t.trip_id ?? ''
     if (tripIndex.has(id)) continue
@@ -125,6 +130,7 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
     tripRouteArr.push(routeIdx.get(t.route_id ?? '') ?? -1)
     tripService.push(t.service_id ?? '')
     tripShape.push(t.shape_id ?? '')
+    tripIds.push(id); tripBlock.push(t.block_id ?? ''); tripDir.push(t.direction_id ?? ''); tripHeadsign.push(t.trip_headsign ?? '')
   }
   const nTrips = tripRouteArr.length
 
@@ -203,7 +209,7 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
 
   return {
     digest, retrieved: v.date_retrieved, routes, routeIds, tripIndex,
-    tripRoute: Int32Array.from(tripRouteArr), tripService, tripShape, tripStart, stSeq, stDep, stStop, stDist, stopIds,
+    tripRoute: Int32Array.from(tripRouteArr), tripService, tripShape, tripIds, tripBlock, tripDir, tripHeadsign, tripStart, stSeq, stDep, stStop, stDist, stopIds,
     calendar, calendarDates,
   }
 }

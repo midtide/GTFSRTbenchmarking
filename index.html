@@ -86,8 +86,12 @@
 
       <div class="card">
         <div class="table-head">
-          <h2>Routes</h2>
+          <div class="tabs" role="tablist" aria-label="Table">
+            <button type="button" role="tab" data-tab="routes" aria-selected="true">Routes</button>
+            <button type="button" role="tab" data-tab="coaches" aria-selected="false">Coaches</button>
+          </div>
           <div class="table-tools">
+            <label class="check" id="coach-all-wrap" hidden><input type="checkbox" id="coach-all"> Show all coaches</label>
             <input type="search" id="search" placeholder="Filter routes" aria-label="Filter routes">
             <button id="csv">Download CSV</button>
           </div>
@@ -127,6 +131,9 @@
           <li>the trip was <code>CANCELED</code> or the stop was <code>SKIPPED</code> in the trip updates feed.</li>
         </ul>
         <p>Everything else is incomplete. The table splits that into trips with no vehicle and trips with a vehicle but no 0–15 minute prediction for the stop. Time of day is the hour of the scheduled departure. Ratings: ≥ 95% best in class, 90–94% good, 85–89% fair, below 85% needs improvement. With sparser sampling a very brief prediction window can be missed, so completeness can read slightly low at 5-minute sampling.</p>
+        <h3>Incomplete trips, blocks and coaches</h3>
+        <p>Expand a route (▸) to see its trips with less than 95% of their scheduled trip-stops complete, filtered to trips whose first departure falls in the selected time of day. For multi-day selections, trips, blocks and coaches with incomplete trips on two or more days are listed first; click one to filter the trip list. A trip that never had a vehicle has no coach, so it is identified by its trip and its GTFS <code>block_id</code> (the scheduled vehicle assignment). A coach is the vehicle seen most on the trip, from vehicle positions and trip updates, shown by its <code>vehicle_label</code> (the number shown to riders) and, where different, its <code>vehicle_id</code>.</p>
+        <p>The Coaches tab lists coaches whose completeness was below 95%. A coach's completeness counts only outcomes a vehicle can affect: trip-stops on trips it was assigned to, which were either complete or had a vehicle but no 0–15 minute ETA. "Days below 95%" counts days on which that share was below 95%.</p>
         <h3>Scope</h3>
         <p>KCM's schedule bundle also includes Sound Transit, Seattle Streetcar and other routes. The table shows routes that appear in KCM's realtime feed in the selected days; routes in the schedule that never appear in the feed are counted in a note but left out. Realtime trip IDs that are not in the schedule are left out and counted in each day's notes.</p>
         <p><button id="clear-cache">Clear saved results</button> <span id="clear-msg" class="hint"></span></p>

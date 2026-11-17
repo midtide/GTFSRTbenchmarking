@@ -4,7 +4,7 @@ import { COLUMNS, getFileIndex, KCM, netStats, readRowGroups, type FileIndex, ty
 import {
   ACC_EARLY, ACC_EARLY_SEC, ACC_LATE, ACC_LATE_SEC, ACC_N, ACC_OK, BUCKETS, STOP_COMP_FIELDS, STOP_FIELDS, stopKey, COMP_COMMUNICATED, COMP_NO_VEHICLE, COMP_PREDICTED,
   COMP_SCHEDULED, COMP_VEHICLE_NO_PRED, COMPLETENESS_HORIZON, HOURS, METRIC_VERSION,
-  accIndex, bucketOf, compIndex, newRollup, type DayResult,
+  accIndex, bucketOf, compIndex, newRollup, TRIP_ISSUE_THRESHOLD, VEH_FIELDS, type DayResult, type TripIssue,
 } from './metrics.ts'
 import { activeServices, findStopTime, loadSchedule, pickScheduleVersion } from './schedule.ts'
 import { addDays, compactDate, serviceDayBase, utcDateString } from './time.ts'
@@ -74,6 +74,14 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   const sd = compactDate(date)
 
   const assigned = new Uint8Array(nTrips)
+  // Which vehicles served each trip (observation counts), and their rider-facing labels.
+  const tripVehicles = new Map<number, Map<string, number>>()
+  const vehicleLabels = new Map<string, string>()
+  const noteVehicle = (t: number, v: string, w: number) => {
+    let m = tripVehicles.get(t)
+    if (!m) tripVehicles.set(t, (m = new Map()))
+    m.set(v, (m.get(v) ?? 0) + w)
+  }
   const canceled = new Uint8Array(nTrips)
   const rtRouteSeen = new Uint8Array(sched.routeIds.length)
   const seen = (t: number) => { const r = sched.tripRoute[t]; if (r >= 0) rtRouteSeen[r] = 1 }
@@ -135,6 +143,8 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
     const seq = cols.current_stop_sequence as ArrayLike<number | null>
     const status = cols.current_status as ArrayLike<number | null>
     const ts = cols.timestamp as ArrayLike<bigint | number | null>
+    const vid = (cols.vehicle_id ?? []) as (string | null)[]
+    const vlabel = (cols.vehicle_label ?? []) as (string | null)[]
     for (let i = 0; i < n; i++) {
       const id = trip[i]
       if (!id || (start[i] && start[i] !== sd)) continue
@@ -143,6 +153,11 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
       const q = seq[i], when = ts[i]
       assigned[t] = 1
       seen(t)
+      const v = vid[i]
+      if (v) {
+        noteVehicle(t, v, 1)
+        if (vlabel[i] && !vehicleLabels.has(v)) vehicleLabels.set(v, vlabel[i]!)
+      }
       if (q == null || when == null) continue
       let list = obs.get(t)
       if (!list) obs.set(t, (list = []))
@@ -212,7 +227,7 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
       if (t < 0) { unmatched.add(id); continue }
       seen(t)
       if (rel[i] === 3) canceled[t] = 1
-      if (veh[i]) assigned[t] = 1
+      if (veh[i]) { assigned[t] = 1; noteVehicle(t, veh[i]!, 1) }
       const q = seq[i]
       if (q == null || q >= SEQ_LIMIT) continue
       const key = t * SEQ_LIMIT + Number(q)
@@ -254,14 +269,34 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   // --- completeness over scheduled trip-stops --------------------------------
   progress('Scoring completeness', 0, 1)
   const compCells = new Map<number, Int32Array>() // per (route, stop): HOURS x [scheduled, complete, no vehicle]
+  const tripIssues: TripIssue[] = []
+  const vehIdx = new Map<string, number>()
+  const vehIds: string[] = []
+  const vehRoutes: Set<string>[] = []
+  const vehCells = new Map<number, Int32Array>() // per vehicle: HOURS x [scheduled, complete, trips, trips below threshold]
+  const vehCell = (v: string) => {
+    let i = vehIdx.get(v)
+    if (i === undefined) { i = vehIds.length; vehIdx.set(v, i); vehIds.push(v); vehRoutes.push(new Set()) }
+    let c = vehCells.get(i)
+    if (!c) vehCells.set(i, (c = new Int32Array(HOURS * 4)))
+    return { i, c }
+  }
   for (let t = 0; t < nTrips; t++) {
     if (!active[t]) continue
     const r = sched.tripRoute[t]
     if (r < 0) continue
     const roll = rollupFor(r)
+    // Per-trip outcome: one status char per stop ('c' complete, 'v' vehicle no ETA, 'n' no vehicle).
+    let status = ''
+    let tSched = 0, tComplete = 0, tNoVeh = 0, tNoEta = 0, tStart = -1
+    const vmap = tripVehicles.get(t)
+    const primary = vmap ? [...vmap].sort((a, b) => b[1] - a[1])[0][0] : ''
+    const pv = primary ? vehCell(primary) : null
+    if (pv) vehRoutes[pv.i].add(sched.routeIds[r])
     for (let j = sched.tripStart[t]; j < sched.tripStart[t + 1]; j++) {
       const d = sched.stDep[j]
       if (d < 0) continue
+      if (tStart < 0) tStart = d
       const hour = Math.min(HOURS - 1, Math.floor(d / 3600))
       const key = t * SEQ_LIMIT + sched.stSeq[j]
       const sk = r * nStops + sched.stStop[j]
@@ -269,10 +304,27 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
       if (!cc) compCells.set(sk, (cc = new Int32Array(HOURS * 3)))
       cc[hour * 3]++
       roll[compIndex(hour, COMP_SCHEDULED)]++
-      if (canceled[t] || skipped.has(key)) { roll[compIndex(hour, COMP_COMMUNICATED)]++; cc[hour * 3 + 1]++ }
-      else if (assigned[t] && predicted.has(key)) { roll[compIndex(hour, COMP_PREDICTED)]++; cc[hour * 3 + 1]++ }
-      else if (assigned[t]) roll[compIndex(hour, COMP_VEHICLE_NO_PRED)]++
-      else { roll[compIndex(hour, COMP_NO_VEHICLE)]++; cc[hour * 3 + 2]++ }
+      tSched++
+      if (canceled[t] || skipped.has(key)) { roll[compIndex(hour, COMP_COMMUNICATED)]++; cc[hour * 3 + 1]++; tComplete++; status += 'c' }
+      else if (assigned[t] && predicted.has(key)) { roll[compIndex(hour, COMP_PREDICTED)]++; cc[hour * 3 + 1]++; tComplete++; status += 'c' }
+      else if (assigned[t]) { roll[compIndex(hour, COMP_VEHICLE_NO_PRED)]++; tNoEta++; status += 'v' }
+      else { roll[compIndex(hour, COMP_NO_VEHICLE)]++; cc[hour * 3 + 2]++; tNoVeh++; status += 'n' }
+      if (pv && assigned[t]) {
+        pv.c[hour * 4]++
+        if (status.endsWith('c')) pv.c[hour * 4 + 1]++
+      }
+    }
+    if (!tSched) continue
+    const startHour = Math.min(HOURS - 1, Math.floor(tStart / 3600))
+    const issue = tComplete / tSched < TRIP_ISSUE_THRESHOLD
+    if (pv) { pv.c[startHour * 4 + 2]++; if (issue) pv.c[startHour * 4 + 3]++ }
+    if (issue) {
+      tripIssues.push({
+        trip: sched.tripIds[t], route: sched.routeIds[r], dir: sched.tripDir[t], headsign: sched.tripHeadsign[t],
+        block: sched.tripBlock[t], start: tStart,
+        vehicles: vmap ? [...vmap].sort((a, b) => b[1] - a[1]).map(([v]) => v) : [],
+        scheduled: tSched, complete: tComplete, noVehicle: tNoVeh, noEta: tNoEta, where: wherePattern(status),
+      })
     }
   }
 
@@ -301,6 +353,19 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   if (stopComp.data.length % STOP_COMP_FIELDS) throw new Error('stop completeness layout')
   if (stopAcc.data.length % STOP_FIELDS) throw new Error('stop accuracy layout')
 
+  const vehData: number[] = []
+  for (const [i, c] of vehCells) {
+    for (let h = 0; h < HOURS; h++) {
+      if (!c[h * 4] && !c[h * 4 + 2]) continue
+      vehData.push(i * HOURS + h, c[h * 4], c[h * 4 + 1], c[h * 4 + 2], c[h * 4 + 3])
+    }
+  }
+  const vehicles = {
+    ids: vehIds, labels: vehIds.map(v => vehicleLabels.get(v) ?? v),
+    routes: vehRoutes.map(x => [...x]), data: Int32Array.from(vehData),
+  }
+  if (vehicles.data.length % VEH_FIELDS) throw new Error('vehicle layout')
+
   const out: Record<string, Int32Array> = {}
   for (const [r, roll] of rollups) out[sched.routeIds[r]] = roll
   const rtRoutes = sched.routeIds.filter((_, r) => rtRouteSeen[r])
@@ -309,11 +374,25 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   return {
     date, version: METRIC_VERSION, stride: opts.stride, partial, notes,
     scheduleDigest: sched.digest, scheduleRetrieved: sched.retrieved,
-    rollups: out, rtRoutes, routes: sched.routes, stopAcc, stopComp,
+    rollups: out, rtRoutes, routes: sched.routes, stopAcc, stopComp, tripIssues, vehicles,
     stats: {
       vpRows, tuRows, tuSnapshots, departures: departures.size,
       predictionsInHorizon: inHorizon, predictionsWithActual: withActual,
       unmatchedTrips: unmatched.size, bytes: netStats.bytes - bytes0,
     },
   }
+}
+
+/** Summarize where along a trip the incomplete stops were. */
+function wherePattern(status: string): TripIssue['where'] {
+  const bad = (ch: string) => ch !== 'c'
+  const n = status.length
+  let first = -1, last = -1, count = 0
+  for (let i = 0; i < n; i++) if (bad(status[i])) { if (first < 0) first = i; last = i; count++ }
+  if (count === n) return 'all'
+  const contiguous = last - first + 1 === count
+  if (contiguous && first === 0) return 'start'
+  if (contiguous && last === n - 1) return 'end'
+  if (contiguous) return 'middle'
+  return 'scattered'
 }
