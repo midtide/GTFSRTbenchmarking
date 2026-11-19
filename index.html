@@ -65,6 +65,15 @@
     <section id="results" hidden>
       <div class="tiles" id="tiles"></div>
 
+      <div class="card" id="diag-card">
+        <div class="table-head">
+          <h2>Daily diagnosis</h2>
+          <div class="table-tools"><label class="check" for="diag-day">Diagnose</label><select id="diag-day" aria-label="Day to diagnose"></select></div>
+        </div>
+        <p class="hint">Patterns found automatically across all routes, with the evidence and likely places to look for causes. Each finding uses the whole service day; the time-of-day filter doesn't apply here.</p>
+        <div id="diag-body"></div>
+      </div>
+
       <div class="card" id="map-card">
         <div class="table-head">
           <h2 id="sel-title">All routes</h2>
@@ -136,6 +145,8 @@
         <p>The Coaches tab lists coaches whose completeness was below 95%. A coach's completeness counts only outcomes a vehicle can affect: trip-stops on trips it was assigned to, which were either complete or had a vehicle but no 0–15 minute ETA. "Days below 95%" counts days on which that share was below 95%.</p>
         <h3>DART routes</h3>
         <p>DART (Dial-A-Ride Transit) routes are identified from the schedule itself: KCM's GTFS gives their trips the fare class described "DART" in <code>fare_attributes.txt</code>, and a route is tagged DART when most of its trips use it. In the September–October 2026 schedules that is routes 204, 224, 249, 902, 903, 906, 907, 914, 915, 917, 930 and 931. The Service column also groups RapidRide, Streetcar, Water taxi (by <code>route_type</code>) and Sound Transit (by <code>agency_id</code>) routes; sort by it to pull each group together, or type "DART" in the filter box.</p>
+        <h3>Daily diagnosis</h3>
+        <p>The diagnosis applies fixed rules to each day's results and reports patterns it recognizes, with the numbers behind them and suggestions for where to look. Rules: trips running under a service the calendar says isn't operating; realtime trip IDs missing from the schedule (and whether an older archived schedule contains them); a whole direction or route with almost no vehicles; blocks with no vehicle all day or for part of the day; trips missing ETAs at their first or last stops; coaches losing ETAs on more than 20% of their trip-stops (and whether they share an ID series); service groups such as DART trailing Metro bus routes; a systematic early or late skew in predictions; routes under 50% accuracy; hours when completeness dips; and archive gaps. For several days, findings with the same subject are merged and show how many days they appeared on. The suggested causes are starting points for investigation, not conclusions: the archive shows what the feed said, not why.</p>
         <h3>Scope</h3>
         <p>KCM's schedule bundle also includes Sound Transit, Seattle Streetcar and other routes. The table shows routes that appear in KCM's realtime feed in the selected days; routes in the schedule that never appear in the feed are counted in a note but left out. Realtime trip IDs that are not in the schedule are left out and counted in each day's data notes. Open a note to see those trips: route, start time, status in the feed (scheduled, added, canceled…), coach, when they were seen, and whether the trip ID appears in another archived schedule version. Often it does: KCM's feed can keep using trip IDs from an earlier schedule for some routes.</p>
         <p><button id="clear-cache">Clear saved results</button> <span id="clear-msg" class="hint"></span></p>

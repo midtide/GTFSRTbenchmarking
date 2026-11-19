@@ -3,6 +3,8 @@ import {
   emptySummaryCounts, summarize, type DayResult, type RouteInfo, type Summary,
 } from '../engine/metrics.ts'
 import type { FromWorker, ToWorker } from '../engine/protocol.ts'
+import { serviceOf } from './service.ts'
+import { diagnoseDay, mergeFindings, type Finding, type MergedFinding } from './diagnosis.ts'
 import { AccuracyMap, BANDS, COMP_BANDS, MIN_SEGMENT_N, MIN_SEGMENT_SCHEDULED, type MapMode, type StopCompStat, type StopStat } from './map.ts'
 import { STOP_COMP_FIELDS, STOP_FIELDS } from '../engine/metrics.ts'
 import {
@@ -23,6 +25,7 @@ const els = {
   search: $<HTMLInputElement>('search'), csv: $<HTMLButtonElement>('csv'), detail: $('detail'),
   tooltip: $('tooltip'), clear: $<HTMLButtonElement>('clear-cache'), clearMsg: $('clear-msg'),
   mapEl: $('map'), mapCard: $('map-card'), mapLegend: $('map-legend'), mapNote: $('map-note'),
+  diagDay: $<HTMLSelectElement>('diag-day'), diagBody: $('diag-body'),
   selTitle: $('sel-title'), selClear: $<HTMLButtonElement>('sel-clear'), mapHint: $('map-hint'),
   modeButtons: [...document.querySelectorAll<HTMLButtonElement>('.seg button[data-mode]')],
   tabButtons: [...document.querySelectorAll<HTMLButtonElement>('.tabs button[data-tab]')],
@@ -57,6 +60,7 @@ const state = {
   showAll: new Set<string>(),           // panel scopes past the row cap
   coachSort: { key: 'days', dir: -1 },
   notesOpen: new Set<string>(),         // dates whose unmatched-trip details are open
+  diagChoice: '' as string,             // day picked in the diagnosis selector ('' = default)
 }
 
 const key = (stride: number, date: string) => `${stride}|${date}`
@@ -299,10 +303,67 @@ function render() {
   els.results.hidden = a.days.length === 0
   if (!a.days.length) return
   renderTiles(a)
+  renderDiagnosis(a)
   renderTable()
   renderDetail()
   renderMap()
 }
+
+// --- Daily diagnosis ------------------------------------------------------------
+
+const diagCache = new WeakMap<DayResult, Finding[]>()
+const findingsFor = (d: DayResult) => {
+  let f = diagCache.get(d)
+  if (!f) diagCache.set(d, (f = diagnoseDay(d, { serviceOf })))
+  return f
+}
+
+function renderDiagnosis(a: ReturnType<typeof aggregate>) {
+  const days = a.days
+  const opts = [...(days.length > 1 ? [['all', `All ${days.length} selected days`]] : []), ...days.map(d => [d.date, fmtDate(d.date)])]
+  els.diagDay.innerHTML = opts.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')
+  // Default: all selected days. A day the viewer picked sticks while it is still selected.
+  els.diagDay.value = opts.some(([v]) => v === state.diagChoice) ? state.diagChoice : opts[0][0]
+  const chosen = els.diagDay.value === 'all' ? days : days.filter(d => d.date === els.diagDay.value)
+  const merged = mergeFindings(chosen.map(findingsFor))
+  const routeNames = routeNameMap(a)
+  for (const d of chosen) for (const [id, info] of Object.entries(d.routes)) routeNames[id] ??= info.short_name || id
+  const stale = chosen.filter(d => !d.diag || !d.unmatched)
+  const count = (sev: string) => merged.filter(f => f.severity === sev).length
+  const card = (f: MergedFinding) => {
+    const routes = f.routes.slice(0, 14)
+    return `<article class="finding sev-${f.severity}">
+      <header><span class="sev">${f.severity}</span><h3>${esc(f.title)}</h3>
+        ${chosen.length > 1 ? `<span class="days-seen">on ${f.dates.length} of ${chosen.length} days</span>` : ''}<span class="cat">${esc(f.category)}</span></header>
+      <p>${esc(f.detail)}</p>
+      <div class="look"><b>Where to look</b><ul>${f.look.map(l => `<li>${esc(l)}</li>`).join('')}</ul></div>
+      ${routes.length ? `<div class="rchips">${routes.map(r => `<button data-route="${esc(r)}" title="Show route ${esc(routeNames[r] ?? r)} on the map">${esc(routeNames[r] ?? r)}</button>`).join('')}${f.routes.length > routes.length ? `<span class="muted small">+${f.routes.length - routes.length} more</span>` : ''}</div>` : ''}
+    </article>`
+  }
+  const main = merged.filter(f => f.severity !== 'low'), low = merged.filter(f => f.severity === 'low')
+  els.diagBody.innerHTML = `
+    <p class="summary">${merged.length ? `${merged.length} finding${merged.length > 1 ? 's' : ''}: ${count('high')} high, ${count('medium')} medium, ${count('low')} low priority.` : 'No patterns found.'}
+      ${chosen.length > 1 ? ' Findings with the same subject are merged across days.' : ''}</p>
+    ${stale.length ? `<p class="hint">${stale.map(d => fmtDate(d.date)).join(', ')} ${stale.length > 1 ? 'were' : 'was'} saved before some of the facts the diagnosis uses were recorded, so a few rules are skipped. <button data-diag-reanalyze="${stale.map(d => d.date).join(',')}">Analyze ${stale.length > 1 ? 'these days' : 'this day'} again</button></p>` : ''}
+    <div class="findings">${main.map(card).join('')}</div>
+    ${low.length ? `<details class="more" ${main.length ? '' : 'open'}><summary>${low.length} lower-priority finding${low.length > 1 ? 's' : ''}</summary><div class="findings">${low.map(card).join('')}</div></details>` : ''}`
+}
+
+els.diagDay.addEventListener('change', () => {
+  state.diagChoice = els.diagDay.value === 'all' ? '' : els.diagDay.value
+  renderDiagnosis(aggregate())
+})
+els.diagBody.addEventListener('click', ev => {
+  const t = ev.target as HTMLElement
+  const r = t.closest<HTMLElement>('[data-route]')
+  if (r) {
+    selectRoute(r.dataset.route!)
+    els.mapCard.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    return
+  }
+  const re = t.closest<HTMLElement>('[data-diag-reanalyze]')
+  if (re) run(re.dataset.diagReanalyze!.split(','), true)
+})
 
 function selectRoute(id: string) {
   state.selected = id
@@ -427,22 +488,7 @@ const bucketCell = (r: RouteRow, b: number) => {
 const barCell = (x: number) => Number.isNaN(x) ? '<td class="muted">—</td>' : `<td><span class="cell-bar">${pct(x)}<i style="width:${Math.max(1, x * 48)}px"></i></span></td>`
 const naturalRoute = (r: RouteRow) => r.info.short_name.replace(/\d+/g, m => m.padStart(5, '0'))
 
-/**
- * DART (Dial-A-Ride Transit) routes are identified from the schedule itself:
- * KCM assigns their trips the fare class described "DART" in fare_attributes.
- * Days saved before fare classes were recorded fall back to the routes that
- * carried that fare class in the Sep–Oct 2026 schedules.
- */
-const DART_FALLBACK = new Set(['204', '224', '249', '902', '903', '906', '907', '914', '915', '917', '930', '931'])
-function serviceOf(info: RouteInfo): string {
-  const isDart = info.fare_class !== undefined ? /\bDART\b/i.test(info.fare_class) : DART_FALLBACK.has(info.short_name)
-  if (isDart) return 'DART'
-  if (info.route_type === '4') return 'Water taxi'
-  if (info.route_type === '0') return 'Streetcar'
-  if (info.agency_id === '40') return 'Sound Transit'
-  if (/ Line$/.test(info.short_name)) return 'RapidRide'
-  return 'Metro bus'
-}
+
 
 const COLS: Col[] = [
   { key: 'route', label: 'Route', get: naturalRoute, csv: r => r.info.short_name,

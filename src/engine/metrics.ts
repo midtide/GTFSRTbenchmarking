@@ -140,6 +140,16 @@ export interface UnmatchedTrip {
   foundIn?: string
 }
 
+/** Extra per-day facts used by the daily diagnosis. */
+export interface DayDiagnostics {
+  /** routes whose trips ran although their service_id is not active that day */
+  offCalendar: { route: string; trips: number; withVehicle: number; services: string[] }[]
+  /** scheduled (active) trips per route and direction, and how many had a vehicle or were canceled */
+  directions: { route: string; dir: string; headsign: string; scheduled: number; withVehicle: number; canceled: number }[]
+  /** blocks with at least one scheduled trip that never had a vehicle */
+  blocks: { block: string; trips: number; noVehicle: number; routes: string[] }[]
+}
+
 export interface DayResult {
   date: string
   version: number
@@ -158,6 +168,8 @@ export interface DayResult {
   tripIssues: TripIssue[]
   /** absent on days saved before this was recorded */
   unmatched?: UnmatchedTrip[]
+  /** absent on days saved before this was recorded */
+  diag?: DayDiagnostics
   vehicles: VehicleStats
   stats: {
     vpRows: number

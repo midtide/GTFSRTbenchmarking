@@ -4,7 +4,7 @@ import { COLUMNS, getFileIndex, KCM, netStats, readRowGroups, type FileIndex, ty
 import {
   ACC_EARLY, ACC_EARLY_SEC, ACC_LATE, ACC_LATE_SEC, ACC_N, ACC_OK, BUCKETS, STOP_COMP_FIELDS, STOP_FIELDS, stopKey, COMP_COMMUNICATED, COMP_NO_VEHICLE, COMP_PREDICTED,
   COMP_SCHEDULED, COMP_VEHICLE_NO_PRED, COMPLETENESS_HORIZON, HOURS, METRIC_VERSION,
-  accIndex, bucketOf, compIndex, newRollup, TRIP_ISSUE_THRESHOLD, VEH_FIELDS, type DayResult, type TripIssue, type UnmatchedTrip,
+  accIndex, bucketOf, compIndex, newRollup, TRIP_ISSUE_THRESHOLD, VEH_FIELDS, type DayDiagnostics, type DayResult, type TripIssue, type UnmatchedTrip,
 } from './metrics.ts'
 import { activeServices, findStopTime, loadSchedule, loadTripIds, pickScheduleVersion } from './schedule.ts'
 import { addDays, compactDate, serviceDayBase, utcDateString } from './time.ts'
@@ -84,7 +84,8 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   }
   const canceled = new Uint8Array(nTrips)
   const rtRouteSeen = new Uint8Array(sched.routeIds.length)
-  const seen = (t: number) => { const r = sched.tripRoute[t]; if (r >= 0) rtRouteSeen[r] = 1 }
+  const rtTripSeen = new Uint8Array(nTrips)
+  const seen = (t: number) => { rtTripSeen[t] = 1; const r = sched.tripRoute[t]; if (r >= 0) rtRouteSeen[r] = 1 }
   const tripCache = { id: '', idx: -1 }
   const lookupTrip = (id: string) => {
     if (id !== tripCache.id) { tripCache.id = id; tripCache.idx = sched.tripIndex.get(id) ?? -1 }
@@ -308,6 +309,8 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   progress('Scoring completeness', 0, 1)
   const compCells = new Map<number, Int32Array>() // per (route, stop): HOURS x [scheduled, complete, no vehicle]
   const tripIssues: TripIssue[] = []
+  const dirStats = new Map<string, { route: string; dir: string; headsign: Map<string, number>; scheduled: number; withVehicle: number; canceled: number }>()
+  const blockStats = new Map<string, { trips: number; noVehicle: number; routes: Set<string> }>()
   const vehIdx = new Map<string, number>()
   const vehIds: string[] = []
   const vehRoutes: Set<string>[] = []
@@ -353,6 +356,25 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
       }
     }
     if (!tSched) continue
+    {
+      const routeId = sched.routeIds[r], dir = sched.tripDir[t]
+      const dk = `${routeId}\u0001${dir}`
+      let ds = dirStats.get(dk)
+      if (!ds) dirStats.set(dk, (ds = { route: routeId, dir, headsign: new Map(), scheduled: 0, withVehicle: 0, canceled: 0 }))
+      ds.scheduled++
+      if (assigned[t]) ds.withVehicle++
+      if (canceled[t]) ds.canceled++
+      const hs = sched.tripHeadsign[t]
+      if (hs) ds.headsign.set(hs, (ds.headsign.get(hs) ?? 0) + 1)
+      const blk = sched.tripBlock[t]
+      if (blk) {
+        let bs = blockStats.get(blk)
+        if (!bs) blockStats.set(blk, (bs = { trips: 0, noVehicle: 0, routes: new Set() }))
+        bs.trips++
+        bs.routes.add(routeId)
+        if (!assigned[t] && !canceled[t]) bs.noVehicle++
+      }
+    }
     const startHour = Math.min(HOURS - 1, Math.floor(tStart / 3600))
     const issue = tComplete / tSched < TRIP_ISSUE_THRESHOLD
     if (pv) { pv.c[startHour * 4 + 2]++; if (issue) pv.c[startHour * 4 + 3]++ }
@@ -404,6 +426,27 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   }
   if (vehicles.data.length % VEH_FIELDS) throw new Error('vehicle layout')
 
+  // Trips the feeds carried although their service is not active today.
+  const offCal = new Map<number, { trips: number; withVehicle: number; services: Set<string> }>()
+  for (let t = 0; t < nTrips; t++) {
+    if (!rtTripSeen[t] || active[t]) continue
+    const r = sched.tripRoute[t]
+    if (r < 0) continue
+    let o = offCal.get(r)
+    if (!o) offCal.set(r, (o = { trips: 0, withVehicle: 0, services: new Set() }))
+    o.trips++
+    if (assigned[t]) o.withVehicle++
+    o.services.add(sched.tripService[t])
+  }
+  const diag: DayDiagnostics = {
+    offCalendar: [...offCal].map(([r, o]) => ({ route: sched.routeIds[r], trips: o.trips, withVehicle: o.withVehicle, services: [...o.services] })),
+    directions: [...dirStats.values()].map(d => ({
+      route: d.route, dir: d.dir, headsign: [...d.headsign].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '',
+      scheduled: d.scheduled, withVehicle: d.withVehicle, canceled: d.canceled,
+    })),
+    blocks: [...blockStats].filter(([, b]) => b.noVehicle > 0).map(([block, b]) => ({ block, trips: b.trips, noVehicle: b.noVehicle, routes: [...b.routes] })),
+  }
+
   // Explain unmatched trips: are they in another archived schedule version?
   if (unmatched.size) {
     progress('Checking other schedule versions', 0, 1)
@@ -425,7 +468,7 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   return {
     date, version: METRIC_VERSION, stride: opts.stride, partial, notes,
     scheduleDigest: sched.digest, scheduleRetrieved: sched.retrieved,
-    rollups: out, rtRoutes, routes: sched.routes, stopAcc, stopComp, tripIssues, vehicles,
+    rollups: out, rtRoutes, routes: sched.routes, stopAcc, stopComp, tripIssues, vehicles, diag,
     unmatched: [...unmatched.values()].map(({ stopSet, lastPoll, vehSet, relSet, ...u }) => ({
       ...u, stops: stopSet.size, vehicles: [...vehSet], vehicleLabels: [...vehSet].map(v => vehicleLabels.get(v) ?? v), relationships: [...relSet].sort(),
     })).sort((a, b) => a.route.localeCompare(b.route, 'en', { numeric: true }) || a.startTime.localeCompare(b.startTime)),

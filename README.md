@@ -12,6 +12,7 @@ The approach is modelled on [Transit Almanac](https://github.com/MisterClean/gtf
 ## What it shows
 
 - **Summary tiles** for the selected days and time of day.
+- **A daily diagnosis**: rule-based findings across all routes, ranked by priority, each with its evidence and where to look for causes. It covers trips running under services the calendar says aren't operating, realtime trip IDs from another schedule version, missing directions or routes, unstaffed blocks, ETAs missing at trip starts or ends, coaches losing ETAs (and shared ID series), service groups such as DART trailing Metro bus, early or late skew in predictions, low-accuracy routes, hourly completeness dips and archive gaps. Multi-day selections merge findings and show how many days each appeared on.
 - **A system map** on OpenStreetMap. Every stretch of route between two stops is colored by how accurate departure predictions were at the stop where it starts (red = worse, blue = better). Hover for details; click a line or a table row to single out that route. A toggle switches the map to **completeness**, coloring the same stretches by the share of scheduled trip-stops that were complete, in the benchmark's rating tiers. Completeness is shown by stop, not whole route, because gaps cluster: whole directions or branches can be missing from the feed while the rest of the route is fine.
 - **Hour-by-hour charts** of accuracy and completeness, and a **bucket chart** splitting each bucket into too early / accurate / too late, with the average minutes off for the early and late predictions.
 - **A route table** with both benchmarks, sortable and downloadable as CSV (including per-bucket early/late shares and average minutes off). Expand a route (▸) to see its trips with less than 95% of trip-stops complete: for multi-day selections, the trips, blocks (for trips that never had a vehicle) and coaches with problems on two or more days come first, and any of them filters the full trip list. Each list downloads as CSV.
@@ -63,7 +64,7 @@ src/engine/
   cache.ts      IndexedDB (file indexes and finished days)
   worker.ts     Web Worker running the engine
   time.ts       service-day clock in America/Los_Angeles
-src/ui/         plain TypeScript interface (no framework)
+src/ui/         plain TypeScript interface (no framework); diagnosis.ts holds the daily-diagnosis rules
 ```
 
 For each service day:
