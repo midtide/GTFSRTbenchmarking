@@ -61,6 +61,8 @@ export interface RouteInfo {
   route_type: string
   color: string
   text_color: string
+  /** description of the fare class most of the route's trips use (e.g. "DART"); absent on older saved days */
+  fare_class?: string
 }
 
 /**

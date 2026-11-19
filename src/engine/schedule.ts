@@ -96,13 +96,16 @@ export function loadSchedule(v: ScheduleVersion): Promise<CompiledSchedule> {
 
 async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
   const digest = v._feed_digest
-  const [routesRows, tripsRows, calRows, cdRows, st] = await Promise.all([
+  const [routesRows, tripsRows, calRows, cdRows, st, fareRows] = await Promise.all([
     readObjects(digest, 'routes'),
-    readObjects(digest, 'trips', ['route_id', 'service_id', 'trip_id', 'shape_id', 'block_id', 'direction_id', 'trip_headsign']),
+    readObjects(digest, 'trips', ['route_id', 'service_id', 'trip_id', 'shape_id', 'block_id', 'direction_id', 'trip_headsign', 'fare_id']),
     readObjects(digest, 'calendar'),
     readObjects(digest, 'calendar_dates'),
     readColumns(digest, 'stop_times', ['trip_id', 'stop_sequence', 'arrival_time', 'departure_time', 'stop_id', 'shape_dist_traveled']),
+    readObjects(digest, 'fare_attributes', ['fare_id', 'descriptions']).catch(() => [] as Record<string, string | null>[]),
   ])
+  const fareDesc = new Map(fareRows.map(f => [f.fare_id ?? '', f.descriptions ?? '']))
+  const routeFares = new Map<string, Map<string, number>>()
 
   const routes: Record<string, RouteInfo> = {}
   const routeIds: string[] = []
@@ -131,6 +134,14 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
     tripService.push(t.service_id ?? '')
     tripShape.push(t.shape_id ?? '')
     tripIds.push(id); tripBlock.push(t.block_id ?? ''); tripDir.push(t.direction_id ?? ''); tripHeadsign.push(t.trip_headsign ?? '')
+    const desc = fareDesc.get(t.fare_id ?? '')
+    if (desc) {
+      const m = routeFares.get(t.route_id ?? '') ?? routeFares.set(t.route_id ?? '', new Map()).get(t.route_id ?? '')!
+      m.set(desc, (m.get(desc) ?? 0) + 1)
+    }
+  }
+  for (const [rid, m] of routeFares) {
+    if (routes[rid]) routes[rid].fare_class = [...m].sort((a, b) => b[1] - a[1])[0][0]
   }
   const nTrips = tripRouteArr.length
 

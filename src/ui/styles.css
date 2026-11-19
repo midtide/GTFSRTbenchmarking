@@ -220,3 +220,8 @@ table.trips td.hs { max-width: 220px; overflow: hidden; text-overflow: ellipsis;
 .unmatched { margin: 6px 0 10px; }
 .unmatched p { font-size: 13px; color: var(--text-2); margin: 6px 0; max-width: 900px; }
 .unmatched button { font-size: 13px; min-height: 30px; }
+
+.tag { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .03em; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border); color: var(--text-2); background: var(--surface); }
+.tag.dart { border-color: var(--accent); color: var(--accent-ink); }
+table.data td.svc { text-align: left; color: var(--text-2); }
+table.data th[data-key="service"] { text-align: left; }

@@ -427,9 +427,27 @@ const bucketCell = (r: RouteRow, b: number) => {
 const barCell = (x: number) => Number.isNaN(x) ? '<td class="muted">—</td>' : `<td><span class="cell-bar">${pct(x)}<i style="width:${Math.max(1, x * 48)}px"></i></span></td>`
 const naturalRoute = (r: RouteRow) => r.info.short_name.replace(/\d+/g, m => m.padStart(5, '0'))
 
+/**
+ * DART (Dial-A-Ride Transit) routes are identified from the schedule itself:
+ * KCM assigns their trips the fare class described "DART" in fare_attributes.
+ * Days saved before fare classes were recorded fall back to the routes that
+ * carried that fare class in the Sep–Oct 2026 schedules.
+ */
+const DART_FALLBACK = new Set(['204', '224', '249', '902', '903', '906', '907', '914', '915', '917', '930', '931'])
+function serviceOf(info: RouteInfo): string {
+  const isDart = info.fare_class !== undefined ? /\bDART\b/i.test(info.fare_class) : DART_FALLBACK.has(info.short_name)
+  if (isDart) return 'DART'
+  if (info.route_type === '4') return 'Water taxi'
+  if (info.route_type === '0') return 'Streetcar'
+  if (info.agency_id === '40') return 'Sound Transit'
+  if (/ Line$/.test(info.short_name)) return 'RapidRide'
+  return 'Metro bus'
+}
+
 const COLS: Col[] = [
   { key: 'route', label: 'Route', get: naturalRoute, csv: r => r.info.short_name,
-    cell: r => `<td><span class="route-name">${expButton('route', r.id, `incomplete trips on route ${r.info.short_name}`)}<span class="badge">${esc(r.info.short_name || r.id)}</span><span class="long">${esc(r.info.long_name)}</span></span></td>` },
+    cell: r => `<td><span class="route-name">${expButton('route', r.id, `incomplete trips on route ${r.info.short_name}`)}<span class="badge">${esc(r.info.short_name || r.id)}</span>${serviceOf(r.info) === 'DART' ? '<span class="tag dart" title="Dial-A-Ride Transit">DART</span>' : ''}<span class="long">${esc(r.info.long_name)}</span></span></td>` },
+  { key: 'service', label: 'Service', get: r => serviceOf(r.info), cell: r => `<td class="svc">${esc(serviceOf(r.info))}</td>`, csv: r => serviceOf(r.info) },
   { key: 'acc', label: 'Accuracy', get: r => r.s.accuracy, cell: r => barCell(r.s.accuracy), csv: r => fmtNum(r.s.accuracy) },
   ...BUCKETS.map((b, i): Col => ({ key: `b${i}`, label: b.label, get: r => (r.s.bucketN[i] < MIN_BUCKET_N ? NaN : r.s.bucketAccuracy[i]), cell: r => bucketCell(r, i), csv: r => fmtNum(r.s.bucketAccuracy[i]) })),
   { key: 'n', label: 'Predictions', get: r => r.s.predictions, cell: r => `<td>${int(r.s.predictions)}</td>`, csv: r => String(r.s.predictions) },
@@ -448,12 +466,16 @@ function sortedRows() {
   const a = aggregate()
   const q = els.search.value.trim().toLowerCase()
   const col = COLS.find(c => c.key === state.sort.key) ?? COLS[0]
-  const rows = a.rows.filter(r => !q || `${r.info.short_name} ${r.info.long_name}`.toLowerCase().includes(q))
+  const rows = a.rows.filter(r => !q || `${r.info.short_name} ${r.info.long_name} ${serviceOf(r.info)}`.toLowerCase().includes(q))
   rows.sort((x, y) => {
     const u = col.get(x), v = col.get(y)
     const un = typeof u === 'number' && Number.isNaN(u), vn = typeof v === 'number' && Number.isNaN(v)
     if (un || vn) return un === vn ? 0 : un ? 1 : -1 // blanks last either way
-    return (u < v ? -1 : u > v ? 1 : 0) * state.sort.dir
+    const c = (u < v ? -1 : u > v ? 1 : 0) * state.sort.dir
+    if (c || col.key === 'route') return c
+    // Ties (e.g. sorting by service) fall back to route number order.
+    const nu = naturalRoute(x), nv = naturalRoute(y)
+    return nu < nv ? -1 : nu > nv ? 1 : 0
   })
   return { a, rows }
 }
@@ -478,11 +500,11 @@ function renderTable() {
   if (state.tab === 'coaches') return renderCoachTable()
   const { a, rows } = sortedRows()
   const head = els.table.tHead!
-  head.innerHTML = `<tr><th></th><th class="group" colspan="6">ETA accuracy</th><th class="group" colspan="5">ETA completeness</th></tr>
+  head.innerHTML = `<tr><th colspan="2"></th><th class="group" colspan="6">ETA accuracy</th><th class="group" colspan="5">ETA completeness</th></tr>
     <tr>${COLS.map(c => `<th class="sortable" data-key="${c.key}" aria-sort="${state.sort.key === c.key ? (state.sort.dir > 0 ? 'ascending' : 'descending') : 'none'}">${c.label}</th>`).join('')}</tr>`
   head.querySelectorAll<HTMLElement>('th.sortable').forEach(th => th.addEventListener('click', () => {
     const k = th.dataset.key!
-    state.sort = { key: k, dir: state.sort.key === k ? -state.sort.dir : k === 'route' ? 1 : -1 }
+    state.sort = { key: k, dir: state.sort.key === k ? -state.sort.dir : k === 'route' || k === 'service' ? 1 : -1 }
     renderTable()
   }))
   const routeNames = routeNameMap(a)
