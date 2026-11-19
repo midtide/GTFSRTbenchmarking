@@ -4,9 +4,11 @@ import { COLUMNS, getFileIndex, KCM, netStats, readRowGroups, type FileIndex, ty
 import {
   ACC_EARLY, ACC_EARLY_SEC, ACC_LATE, ACC_LATE_SEC, ACC_N, ACC_OK, BUCKETS, STOP_COMP_FIELDS, STOP_FIELDS, stopKey, COMP_COMMUNICATED, COMP_NO_VEHICLE, COMP_PREDICTED,
   COMP_SCHEDULED, COMP_VEHICLE_NO_PRED, COMPLETENESS_HORIZON, HOURS, METRIC_VERSION,
-  accIndex, bucketOf, compIndex, newRollup, TRIP_ISSUE_THRESHOLD, VEH_FIELDS, type DayDiagnostics, type DayResult, type TripIssue, type UnmatchedTrip,
+  accIndex, bucketOf, compIndex, newRollup, TRIP_ISSUE_THRESHOLD, VEH_FIELDS, DIAG_VERSION, type DayDiagnostics, type DayResult, type TripIssue, type UnmatchedTrip,
 } from './metrics.ts'
 import { activeServices, findStopTime, loadSchedule, loadTripIds, pickScheduleVersion } from './schedule.ts'
+import { QualityCollector } from './quality.ts'
+import { loadShapeGrid } from './shapegrid.ts'
 import { addDays, compactDate, serviceDayBase, utcDateString } from './time.ts'
 
 export interface AnalyzeOptions {
@@ -72,6 +74,9 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   const utcDates: string[] = []
   for (let d = utcDateString(tStart); d <= utcDateString(tEnd); d = addDays(d, 1)) utcDates.push(d)
   const sd = compactDate(date)
+  // Route shapes for off-route checks (optional: the diagnosis skips that rule without them).
+  const grid = await loadShapeGrid(picked.version).catch(() => null)
+  const qc = new QualityCollector(sched, base, opts.stride, grid)
 
   const assigned = new Uint8Array(nTrips)
   // Which vehicles served each trip (observation counts), and their rider-facing labels.
@@ -148,7 +153,10 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
   const vpJobs = vpFiles.flatMap(f => f.groups.map(g => ({ idx: f.idx, g })))
   let vpDone = 0
   await pool(vpJobs, CONCURRENCY, async ({ idx, g }) => {
-    const { n, cols } = await readRowGroups(idx, g, COLUMNS.vehicle_positions, 1 << 20)
+    const { n, cols, starts } = await readRowGroups(idx, g, COLUMNS.vehicle_positions, 1 << 20)
+    const lat = (cols.latitude ?? []) as ArrayLike<number | null>
+    const lon = (cols.longitude ?? []) as ArrayLike<number | null>
+    let gk = 0, pollTime = idx.times[g[0]]
     const trip = cols.trip_id as string[], start = cols.start_date as string[]
     const seq = cols.current_stop_sequence as ArrayLike<number | null>
     const status = cols.current_status as ArrayLike<number | null>
@@ -157,9 +165,11 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
     const vroute = (cols.route_id ?? []) as (string | null)[]
     const vlabel = (cols.vehicle_label ?? []) as (string | null)[]
     for (let i = 0; i < n; i++) {
+      while (i >= starts[gk + 1]) pollTime = idx.times[g[++gk]]
       const id = trip[i]
       if (!id || (start[i] && start[i] !== sd)) continue
       const t = lookupTrip(id)
+      qc.vp(t, vid[i] || null, ts[i] == null ? NaN : Number(ts[i]), Number(lat[i] ?? NaN), Number(lon[i] ?? NaN), pollTime)
       if (t < 0) {
         const u = miss(id)
         u.inVehiclePositions = true
@@ -228,12 +238,18 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
     progress('Reading trip updates index', 0, 1)
     const idx = await getFileIndex('trip_updates', utc)
     checkCoverage('Trip updates', utc, idx)
-    if (idx) tuFiles.push({ idx, groups: chunk(selectGroups(idx, opts.stride), TU_BATCH) })
+    if (idx) {
+      const groups = selectGroups(idx, opts.stride)
+      qc.addSampleTimes(groups.map(i => (Number.isFinite(idx.feedTimes?.[i]) ? idx.feedTimes[i] : idx.times[i])))
+      tuFiles.push({ idx, groups: chunk(groups, TU_BATCH) })
+    }
   }
-  const tuJobs = tuFiles.flatMap(f => f.groups.map(g => ({ idx: f.idx, g })))
+  const tuJobs = tuFiles.flatMap(f => f.groups.map(g => ({ idx: f.idx, g }))).map((job, batch) => ({ ...job, batch }))
   let tuDone = 0
-  await pool(tuJobs, CONCURRENCY, async ({ idx, g }) => {
+  await pool(tuJobs, CONCURRENCY, async ({ idx, g, batch }) => {
     const { n, cols } = await readRowGroups(idx, g, COLUMNS.trip_updates)
+    const tdir = (cols.direction_id ?? []) as ArrayLike<number | null>
+    const jitterBuf: number[] = []
     const feedTs = cols.feed_timestamp as ArrayLike<bigint | number | null>
     const trip = cols.trip_id as string[], start = cols.start_date as string[]
     const rel = cols.schedule_relationship as ArrayLike<number | null>
@@ -268,15 +284,18 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
       if (rel[i] === 3) canceled[t] = 1
       if (veh[i]) { assigned[t] = 1; noteVehicle(t, veh[i]!, 1) }
       const q = seq[i]
+      const j = q == null ? -1 : findStopTime(sched, t, Number(q))
+      qc.tuRow(t, veh[i] || null, troute[i] || null, tdir[i] ?? null, rel[i] ?? null, q ?? null, j)
       if (q == null || q >= SEQ_LIMIT) continue
       const key = t * SEQ_LIMIT + Number(q)
-      if (srel[i] === 1) { skipped.add(key); continue }
+      if (srel[i] === 1) { skipped.add(key); qc.skippedStop(t, j); continue }
       const p = dep[i], s = feedTs[i]
       if (p == null || s == null) continue
       const pred = Number(p), sample = Number(s)
       const lead = pred - sample
       if (lead >= 0 && lead <= COMPLETENESS_HORIZON) { predicted.add(key); inHorizon++ }
       const actual = departures.get(key)
+      qc.prediction(t, key, j, !!veh[i], pred, sample, actual, jitterBuf)
       if (actual === undefined) continue
       const b = bucketOf(actual - sample)
       if (b < 0) continue
@@ -291,7 +310,6 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
       if (err < -BUCKETS[b].early) { roll[accIndex(hour, b, ACC_EARLY)]++; roll[accIndex(hour, b, ACC_EARLY_SEC)] += Math.round(-err); cls = 2 }
       else if (err > BUCKETS[b].late) { roll[accIndex(hour, b, ACC_LATE)]++; roll[accIndex(hour, b, ACC_LATE_SEC)] += Math.round(err); cls = 3 }
       else roll[accIndex(hour, b, ACC_OK)]++
-      const j = findStopTime(sched, t, Number(q))
       if (j >= 0) {
         const sk = r * nStops + sched.stStop[j]
         let cells = stopCells.get(sk)
@@ -300,6 +318,7 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
         cells[hour * 4 + cls]++
       }
     }
+    qc.commit(batch, jitterBuf)
     tuRows += n
     tuSnapshots += g.length
     progress('Trip updates', ++tuDone, tuJobs.length)
@@ -438,7 +457,17 @@ export async function analyzeDay(date: string, versions: ScheduleVersion[], opts
     if (assigned[t]) o.withVehicle++
     o.services.add(sched.tripService[t])
   }
+  progress('Checking feed quality', 0, 1)
+  const quality = qc.finish({
+    active, assigned, canceled, predicted, departures, tStart, tEnd,
+    feeds: [
+      { feed: 'trip_updates', indexes: tuFiles.map(f => f.idx) },
+      { feed: 'vehicle_positions', indexes: vpFiles.map(f => f.idx) },
+    ],
+  })
   const diag: DayDiagnostics = {
+    version: DIAG_VERSION,
+    quality,
     offCalendar: [...offCal].map(([r, o]) => ({ route: sched.routeIds[r], trips: o.trips, withVehicle: o.withVehicle, services: [...o.services] })),
     directions: [...dirStats.values()].map(d => ({
       route: d.route, dir: d.dir, headsign: [...d.headsign].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '',

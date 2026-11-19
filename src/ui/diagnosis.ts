@@ -13,7 +13,7 @@ export interface Finding {
   /** stable key so the same finding can be matched across days */
   key: string
   severity: Severity
-  category: 'Schedule vs. feed' | 'Vehicle assignment' | 'Equipment' | 'Predictions' | 'Service groups' | 'Time of day' | 'Data'
+  category: 'Schedule vs. feed' | 'Vehicle assignment' | 'Equipment' | 'Predictions' | 'Service groups' | 'Time of day' | 'Feed health' | 'Data'
   title: string
   /** evidence, plain text (escaped when rendered) */
   detail: string
@@ -31,7 +31,43 @@ interface Ctx {
   serviceOf: (info: RouteInfo) => string
 }
 
+/**
+ * When the feed-quality rules raise a finding. Rules recommended as most
+ * explanatory (ghost countdowns, timetable shown as live, jitter, early
+ * timepoint departures, frozen feeds) are tuned to be more sensitive; the
+ * rest need a larger, sustained pattern so scattered anomalies don't flag.
+ * Calibrated against KCM data from November 2026.
+ */
+export const THRESHOLDS = {
+  // sensitive
+  ghostRouteShare: 0.03, ghostRouteMin: 20, ghostHighShare: 0.10,
+  timetableSystemShare: 0.05, timetableMediumShare: 0.15, timetableRouteShare: 0.40, timetableRouteMin: 300,
+  jitterRatio: 2, jitterFloor: 0.5, jitterHigh: 2.0, jitterMinPairs: 200,
+  tpEarlyLow: 0.03, tpEarlyMedium: 0.08, tpEarlyHigh: 0.15, tpEarlyMinDeps: 500, tpEarlyRouteShare: 0.25, tpEarlyRouteMin: 30,
+  frozenSpanMin: 3, frozenTotalMin: 6, frozenMediumMin: 10, frozenHighMin: 30, feedAgeMax: 65, feedRefreshMax: 35,
+  // higher thresholds
+  pastRouteShare: 0.10, pastRouteMin: 300,
+  canceledRanRoute: 5, canceledRanSystem: 30,
+  lateFirstRouteShare: 0.30, lateFirstRouteMin: 200,
+  coverageRouteMax: 0.75, coverageRouteMin: 500,
+  pairingSystemMin: 10, pairingSystemShare: 0.03,
+  dupTripsSystem: 10, twoTripPolls: 9, twoTripVehicles: 10,
+  oneFeedSystem: 30, oneFeedShare: 0.03,
+  badSeqSystem: 10, badSeqRoute: 5, idMismatchSystem: 10, addedInGtfsSystem: 10,
+  skipStopTrips: 20, skipStopsPerRoute: 3,
+  staleCoachShare: 0.25, staleCoachMinReports: 60, staleCoaches: 3, staleSystemShare: 0.05,
+  sparseCoachGap: 90, sparseCoachMinReports: 100, sparseCoaches: 3,
+  offRouteShare: 0.20, offRouteMin: 10,
+  jumpCoachMin: 100, jumpCoaches: 5,
+  outOfAreaCoachMin: 20, outOfAreaCoaches: 2,
+}
+const T = THRESHOLDS
+
 const pct = (x: number, d = 0) => `${(x * 100).toFixed(d)}%`
+const localClock = (() => {
+  const f = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', minute: '2-digit' })
+  return (epoch: number) => f.format(new Date(epoch * 1000)).replace(' AM', 'a').replace(' PM', 'p')
+})()
 const plural = (n: number, w: string, ws = w + 's') => `${n.toLocaleString('en-US')} ${n === 1 ? w : ws}`
 const shortDate = (iso: string) => new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
 const listNames = (names: string[], max = 8) => names.length <= max ? names.join(', ') : `${names.slice(0, max).join(', ')} and ${names.length - max} more`
@@ -103,7 +139,8 @@ export function diagnoseDay(day: DayResult, ctx: Ctx): Finding[] {
         : `Route ${name(route)}: the feed uses trip IDs that aren't in any archived schedule`,
       detail: `${plural(list.length, 'trip')} ran (${withVeh} with vehicle positions) under trip IDs that are not in the schedule captured ${shortDate(day.scheduleRetrieved)}`
         + (topVersion ? `; ${versions.get(topVersion)} of them are in the schedule captured ${shortDate(topVersion)}.` : '.')
-        + ' These trips are invisible to both benchmarks.',
+        + ' These trips are invisible to both benchmarks.'
+        + (list.some(u => u.relationships.includes(1)) ? '' : ' None were marked ADDED, which a trip that is not in the schedule should be (validator rule E003).'),
       look: topVersion ? [
         'Whether the realtime feed for this route is generated against the previous schedule (service change not loaded in CAD/AVL).',
         'Whether this route\'s trips were dropped or renumbered in the new GTFS by mistake.',
@@ -359,6 +396,247 @@ export function diagnoseDay(day: DayResult, ctx: Ctx): Finding[] {
         'Shift changes or relief points where operators log off and on.',
         'Late-night or peak-only service run by a different operator or system.',
       ],
+    })
+  }
+
+  // 12+. Feed-quality rules (recorded from diagnostics version 2 on).
+  const Q = diag?.quality
+  if (Q) {
+    const rq = Object.entries(Q.routes).filter(([id]) => rt.has(id))
+    const sum = (f: keyof typeof Q.routes[string]) => rq.reduce((a, [, q]) => a + (q[f] as number), 0)
+    const labels = new Map<string, string>()
+    day.vehicles?.ids.forEach((id, i) => labels.set(id, day.vehicles.labels[i] || id))
+    const coach = (id: string) => { const l = labels.get(id) ?? id; return l === id ? id : `${l} (id ${id})` }
+    const routeList = (xs: { id: string; text: string }[], max = 8) => listNames(xs.map(x => `${name(x.id)} (${x.text})`), max)
+
+    // Ghost countdowns: a 0–15 min prediction for a trip that never had a vehicle.
+    const ghosts = rq.map(([id, q]) => ({ id, n: q.ghostStops, share: q.scheduledStops ? q.ghostStops / q.scheduledStops : 0 }))
+      .filter(x => x.n >= T.ghostRouteMin && x.share >= T.ghostRouteShare).sort((a, b) => b.share - a.share)
+    if (ghosts.length) {
+      const total = sum('ghostStops'), sched = sum('scheduledStops')
+      add({
+        key: 'ghost', severity: ghosts.some(g => g.share >= T.ghostHighShare) ? 'high' : 'medium', category: 'Predictions', routes: ghosts.map(g => g.id),
+        title: `Ghost countdowns: riders were shown departures for trips that never had a bus`,
+        detail: `${plural(total, 'trip-stop')} (${pct(total / sched, 1)} of all scheduled) had a 0–15 minute prediction although the trip never had a vehicle and wasn't canceled. Highest: ${routeList(ghosts.map(g => ({ id: g.id, text: `${g.n}, ${pct(g.share, 1)}` })))}.`,
+        look: [
+          'Predictions published from the timetable before a vehicle is assigned, for trips that then never ran (missed pull-outs, unstaffed blocks): see the blocks findings.',
+          'Whether predictions for unassigned trips are withdrawn, or the trip canceled, once it is clear no vehicle will serve it.',
+        ],
+      })
+    }
+    // Timetable times published as live predictions.
+    const live = sum('predLive'), copies = sum('predNoVehSched'), noVeh = sum('predNoVeh')
+    if (live && copies / live >= T.timetableSystemShare) {
+      const tops = rq.filter(([, q]) => q.predLive >= T.timetableRouteMin && q.predNoVehSched / q.predLive >= T.timetableRouteShare)
+        .map(([id, q]) => ({ id, share: q.predNoVehSched / q.predLive })).sort((a, b) => b.share - a.share)
+      add({
+        key: 'timetable-live', severity: copies / live >= T.timetableMediumShare ? 'medium' : 'low', category: 'Predictions', routes: tops.map(t => t.id),
+        title: `${pct(copies / live)} of near-term predictions are just the timetable, with no vehicle`,
+        detail: `${pct(noVeh / live)} of predictions 0–30 minutes out came from trips with no vehicle assigned, and ${pct(copies / Math.max(1, noVeh))} of those equal the scheduled time exactly. Apps can't tell them from GPS-based predictions.`
+          + (tops.length ? ` Highest share: ${routeList(tops.map(t => ({ id: t.id, text: pct(t.share) })))}.` : ''),
+        look: [
+          'Upcoming trips whose vehicle is still on its previous trip: predictions could carry that trip\'s delay forward instead of repeating the timetable.',
+          'Whether to omit predictions (show schedule only) until a vehicle is assigned, so riders know the time is not live.',
+        ],
+      })
+    }
+    // Prediction jitter (Caltrans / Newmark "prediction inconsistency").
+    const sysJ = sum('jitterChange') / Math.max(1, sum('jitterTime'))
+    const jit = rq.filter(([, q]) => q.jitterPairs >= T.jitterMinPairs).map(([id, q]) => ({ id, j: q.jitterChange / q.jitterTime }))
+      .filter(x => x.j >= Math.max(T.jitterRatio * sysJ, T.jitterFloor)).sort((a, b) => b.j - a.j)
+    if (jit.length) {
+      add({
+        key: 'jitter', severity: jit.some(x => x.j >= T.jitterHigh) ? 'high' : 'medium', category: 'Predictions', routes: jit.map(x => x.id),
+        title: `Predictions jump around on ${plural(jit.length, 'route')}`,
+        detail: `Across the system a prediction moves about ${Math.round(sysJ * 60)} seconds per minute as the bus approaches. On ${routeList(jit.map(x => ({ id: x.id, text: `${Math.round(x.j * 60)} s/min` })))} it moves at least twice as much, so countdowns lurch up and down.`,
+        look: [
+          'How predictions are generated for these routes (for DART: route deviations and the contractor\'s vehicle data).',
+          'Vehicles switching between trips, or stop progress resetting, which makes predictions restart.',
+          'Prediction smoothing or damping settings.',
+        ],
+      })
+    }
+    // Early departures from timepoints.
+    const tpDeps = sum('tpDeps'), tpEarly = sum('tpEarly')
+    if (tpDeps >= T.tpEarlyMinDeps && tpEarly / tpDeps >= T.tpEarlyLow) {
+      const share = tpEarly / tpDeps
+      const tops = rq.filter(([, q]) => q.tpDeps >= T.tpEarlyRouteMin && q.tpEarly / q.tpDeps >= T.tpEarlyRouteShare)
+        .map(([id, q]) => ({ id, share: q.tpEarly / q.tpDeps })).sort((a, b) => b.share - a.share)
+      add({
+        key: 'timepoint-early', severity: share >= T.tpEarlyHigh ? 'high' : share >= T.tpEarlyMedium ? 'medium' : 'low', category: 'Predictions', routes: tops.map(t => t.id),
+        title: `${pct(share)} of timepoint departures left more than a minute early`,
+        detail: `${plural(tpEarly, 'departure')} of ${tpDeps.toLocaleString('en-US')} from timepoint stops left over 60 seconds before the scheduled time, ${(sum('tpEarlySec') / Math.max(1, tpEarly) / 60).toFixed(1)} minutes early on average. Early departures make predictions anchored to the schedule run late (see the early-skew finding).`
+          + (tops.length ? ` Most affected: ${routeList(tops.map(t => ({ id: t.id, text: pct(t.share) })))}.` : ''),
+        look: [
+          'Operators leaving timepoints early: KCM\'s early-departure policy and how it is enforced.',
+          'Running times padded too generously at these timepoints.',
+          'Whether these are holding timepoints in practice (stop_times.timepoint = 1 is set on many stops).',
+        ],
+      })
+    }
+    // Frozen, stale or slow feeds.
+    for (const f of Q.feeds) {
+      const feedName = f.feed === 'trip_updates' ? 'Trip updates' : 'Vehicle positions'
+      const longest = Math.max(0, ...f.frozen.map(x => x.minutes))
+      if (longest >= T.frozenSpanMin || f.frozenMinutes >= T.frozenTotalMin) {
+        add({
+          key: `frozen|${f.feed}`, severity: f.frozenMinutes >= T.frozenHighMin ? 'high' : f.frozenMinutes >= T.frozenMediumMin ? 'medium' : 'low', category: 'Feed health', routes: [],
+          title: `${feedName} feed stopped updating for ${f.frozenMinutes} minutes in total`,
+          detail: `The feed's header timestamp stayed the same for 2+ minutes ${plural(f.frozen.length, 'time')}; longest ${longest} minutes. Spans: ${f.frozen.slice(0, 6).map(x => `${localClock(x.start)} (${x.minutes} min)`).join(', ')}.`,
+          look: ['The feed producer (CAD/AVL export or prediction service) stalling.', 'Gaps in gtfsrt.io\'s capture: compare with the archive notes for this day.'],
+        })
+      }
+      if (f.medianAge > T.feedAgeMax) add({
+        key: `age|${f.feed}`, severity: 'medium', category: 'Feed health', routes: [],
+        title: `${feedName} feed is stale: median ${Math.round(f.medianAge)} seconds old`,
+        detail: `When fetched, the feed's header timestamp was typically ${Math.round(f.medianAge)} s old (95th percentile ${Math.round(f.p95Age)} s). The validator warns above 65 s (W008).`,
+        look: ['Caching between the producer and the published URL.', 'The producer\'s publishing interval.'],
+      })
+      if (f.medianRefresh > T.feedRefreshMax) add({
+        key: `refresh|${f.feed}`, severity: 'low', category: 'Feed health', routes: [],
+        title: `${feedName} feed refreshes slowly: every ${Math.round(f.medianRefresh)} seconds`,
+        detail: `The validator warns above 35 s (W007); California's guidelines ask for 20 s.`,
+        look: ['The producer\'s publishing interval.'],
+      })
+    }
+    // Predictions stuck in the past.
+    const past = rq.filter(([, q]) => q.pastBase >= T.pastRouteMin && q.pastPred / q.pastBase >= T.pastRouteShare).map(([id, q]) => ({ id, share: q.pastPred / q.pastBase }))
+    if (past.length) add({
+      key: 'past', severity: 'medium', category: 'Predictions', routes: past.map(p => p.id),
+      title: `Predictions stuck in the past on ${plural(past.length, 'route')}`,
+      detail: `Share of predictions more than a minute in the past while the bus had not yet left: ${routeList(past.map(p => ({ id: p.id, text: pct(p.share) })))}. Apps show these as "now" or "departed".`,
+      look: ['The prediction engine holding the last prediction while a vehicle dwells or loses its signal.', 'Vehicles stuck at a stop or layover point with stop progress not advancing.'],
+    })
+    // Canceled trips that ran.
+    const cr = rq.filter(([, q]) => q.canceledRan >= T.canceledRanRoute), crTotal = sum('canceledRan')
+    if (cr.length || crTotal >= T.canceledRanSystem) add({
+      key: 'canceled-ran', severity: 'medium', category: 'Schedule vs. feed', routes: cr.map(([id]) => id),
+      title: `${plural(crTotal, 'trip')} marked CANCELED still ran`,
+      detail: `A vehicle made progress on these trips although the feed marked them canceled.${cr.length ? ` Routes: ${routeList(cr.map(([id, q]) => ({ id, text: String(q.canceledRan) })))}.` : ''} Riders were told not to wait for a bus that came.`,
+      look: ['Cancellations entered but not reversed when service was restored.', 'Cancellation and vehicle assignment handled in different systems.'],
+    })
+    // Late-appearing predictions.
+    const lf = rq.filter(([, q]) => q.firstBase >= T.lateFirstRouteMin && q.lateFirst / q.firstBase >= T.lateFirstRouteShare).map(([id, q]) => ({ id, share: q.lateFirst / q.firstBase }))
+      .sort((a, b) => b.share - a.share)
+    if (lf.length) add({
+      key: 'late-first', severity: 'medium', category: 'Predictions', routes: lf.map(x => x.id),
+      title: `Predictions appear late on ${plural(lf.length, 'route')}`,
+      detail: `Share of trip-stops whose first prediction appeared less than 15 minutes before the bus left: ${routeList(lf.map(x => ({ id: x.id, text: pct(x.share) })))}.`,
+      look: ['Vehicles logging in or being assigned shortly before the trip.', 'Whether these routes\' trips are published in the trip-updates feed before they start.'],
+    })
+    // Update coverage before departure (approximation of Caltrans' update completeness).
+    const cov = rq.filter(([, q]) => q.covExp >= T.coverageRouteMin && q.covObs / q.covExp < T.coverageRouteMax).map(([id, q]) => ({ id, c: q.covObs / q.covExp }))
+    if (cov.length) add({
+      key: 'coverage', severity: 'medium', category: 'Predictions', routes: cov.map(x => x.id),
+      title: `Predictions drop in and out before departure on ${plural(cov.length, 'route')}`,
+      detail: `In the 30 minutes before a bus left, a prediction was present in less than ${pct(T.coverageRouteMax)} of sampled snapshots: ${routeList(cov.map(x => ({ id: x.id, text: pct(x.c) })))}. (California's goal, at two updates a minute, is 90%; this is measured at the sampling rate.)`,
+      look: ['Intermittent vehicle reporting on these routes.', 'Trips dropping out of the feed while vehicles lay over.'],
+    })
+    // Feed consistency (validator rules E047, E052/duplicate trip, W003, E051, E035/E024, E016).
+    const pm = sum('pairMismatch'), pb = sum('pairBoth')
+    if (pm >= T.pairingSystemMin && pb && pm / pb >= T.pairingSystemShare) add({
+      key: 'pairing', severity: 'medium', category: 'Schedule vs. feed', routes: rq.filter(([, q]) => q.pairMismatch >= 3).map(([id]) => id),
+      title: `Trip updates and vehicle positions disagree on the vehicle for ${plural(pm, 'trip')}`,
+      detail: `${pct(pm / pb, 1)} of trips reported in both feeds named different vehicles (validator rule E047).`,
+      look: ['The two feeds being generated from different assignment data or at different times.'],
+    })
+    const dup = sum('dupTrips')
+    if (dup >= T.dupTripsSystem) add({
+      key: 'dup-trips', severity: 'medium', category: 'Vehicle assignment', routes: rq.filter(([, q]) => q.dupTrips > 0).map(([id]) => id),
+      title: `${plural(dup, 'trip')} were reported by two vehicles at once`,
+      detail: 'Each was reported by two or more vehicles in at least three polls.',
+      look: ['Vehicle swaps where the old vehicle stays logged in to the trip.', 'Tripper or extra buses logged in to a regular trip.'],
+    })
+    const two = Q.vehiclesOnTwoTrips.filter(v => v.polls >= T.twoTripPolls)
+    if (two.length >= T.twoTripVehicles) add({
+      key: 'veh-two-trips', severity: 'low', category: 'Vehicle assignment', routes: [],
+      title: `${plural(two.length, 'vehicle')} were on two trips at once for 3+ minutes`,
+      detail: `For example ${two.slice(0, 6).map(v => coach(v.id)).join(', ')}.`,
+      look: ['The next trip starting in the feed before the previous one ends (layover handling).'],
+    })
+    const oneFeed = sum('vpOnly') + sum('tuOnly'), running = sum('running')
+    if (oneFeed >= T.oneFeedSystem && running && oneFeed / running >= T.oneFeedShare) add({
+      key: 'one-feed', severity: 'medium', category: 'Schedule vs. feed', routes: rq.filter(([, q]) => q.vpOnly + q.tuOnly >= 3).map(([id]) => id),
+      title: `${plural(oneFeed, 'running trip')} appeared in only one of the two feeds`,
+      detail: `${sum('vpOnly')} had vehicle positions but no predictions; ${sum('tuOnly')} had a vehicle in trip updates but no positions (validator W003; California expects every trip in both).`,
+      look: ['Trip-update generation failing for some trips (e.g. vehicles off-route or not matched to the schedule).'],
+    })
+    const bs = sum('badSeqTrips')
+    if (bs >= T.badSeqSystem) add({
+      key: 'bad-seq', severity: 'medium', category: 'Schedule vs. feed', routes: rq.filter(([, q]) => q.badSeqTrips >= T.badSeqRoute).map(([id]) => id),
+      title: `${plural(bs, 'trip')} predicted stops that aren't on the trip`,
+      detail: 'Their trip updates used stop sequences missing from the schedule for that trip (validator E051).',
+      look: ['A stop pattern change in the schedule that the realtime system hasn\'t picked up.'],
+    })
+    const idm = sum('routeMismatch') + sum('dirMismatch')
+    if (idm >= T.idMismatchSystem) add({
+      key: 'id-mismatch', severity: 'medium', category: 'Schedule vs. feed', routes: rq.filter(([, q]) => q.routeMismatch + q.dirMismatch > 0).map(([id]) => id),
+      title: `${plural(idm, 'trip')} carried a route or direction that contradicts the schedule`,
+      detail: `${sum('routeMismatch')} route_id and ${sum('dirMismatch')} direction_id mismatches (validator E035, E024).`,
+      look: ['Interlined trips reported under the wrong route.', 'Direction coding differing between scheduling and CAD/AVL.'],
+    })
+    const ag = sum('addedInGtfs')
+    if (ag >= T.addedInGtfsSystem) add({
+      key: 'added-in-gtfs', severity: 'low', category: 'Schedule vs. feed', routes: rq.filter(([, q]) => q.addedInGtfs > 0).map(([id]) => id),
+      title: `${plural(ag, 'trip')} marked ADDED are already in the schedule`,
+      detail: 'ADDED is for trips that are not in the schedule (validator E016).',
+      look: ['How extra or replacement service is published.'],
+    })
+    // Skipped-stop clusters (likely detours) and off-route trips.
+    const offBy = new Map(rq.map(([id, q]) => [id, q]))
+    const det = Q.skippedClusters.filter(c => rt.has(c.route)).map(c => ({ ...c, stops: c.stops.filter(st => st.trips >= T.skipStopTrips) }))
+      .filter(c => c.stops.length >= T.skipStopsPerRoute)
+    if (det.length) add({
+      key: 'detours', severity: 'low', category: 'Schedule vs. feed', routes: det.map(c => c.route),
+      title: `Likely detours on ${plural(det.length, 'route')}: stops skipped all day`,
+      detail: det.slice(0, 6).map(c => `${name(c.route)}: ${listNames(c.stops.slice(0, 3).map(st => `${st.name} (${st.trips} trips)`), 3)}${c.stops.length > 3 ? ` and ${c.stops.length - 3} more stops` : ''}${(offBy.get(c.route)?.offRouteTrips ?? 0) >= 5 ? '; vehicles also ran off the mapped route' : ''}`).join('. ')
+        + '. Marking the stops SKIPPED is the right practice; this is a prompt to check the rider-facing side.',
+      look: ['That a service alert, or trip modifications with the detour shape, were published for these routes.', 'Whether the detour is long-term and belongs in the schedule.'],
+    })
+    const off = rq.filter(([, q]) => q.running && q.offRouteTrips >= T.offRouteMin && q.offRouteTrips / q.running >= T.offRouteShare)
+      .map(([id, q]) => ({ id, n: q.offRouteTrips, share: q.offRouteTrips / q.running }))
+    if (off.length) add({
+      key: 'off-route', severity: 'medium', category: 'Schedule vs. feed', routes: off.map(o => o.id),
+      title: `Buses ran away from the mapped route on ${plural(off.length, 'route')}`,
+      detail: `Share of running trips with five or more consecutive positions (2+ minutes) more than about 200 m from the trip's shape (validator E029): ${routeList(off.map(o => ({ id: o.id, text: `${o.n} trips, ${pct(o.share)}` })))}.`
+        + (off.some(o => det.some(c => c.route === o.id)) ? ' Stops on the same routes were skipped, which points to a detour.' : ''),
+      look: ['Detours not reflected in the schedule or published as trip modifications.', 'Shapes in shapes.txt that don\'t match the streets actually used.'],
+    })
+    // Coach position reporting.
+    const stale = Q.coaches.filter(c => c.reports >= T.staleCoachMinReports && c.staleShare >= T.staleCoachShare)
+    const sysStale = Q.coachTotals.polls ? Q.coachTotals.stalePolls / Q.coachTotals.polls : 0
+    if (stale.length >= T.staleCoaches || sysStale >= T.staleSystemShare) add({
+      key: 'stale-coaches', severity: 'medium', category: 'Equipment', routes: [...new Set(stale.flatMap(c => c.routes))],
+      title: `Stale vehicle positions: ${plural(stale.length, 'coach', 'coaches')} often reported positions over 3 minutes old`,
+      detail: `${pct(sysStale, 1)} of all vehicle reports were more than 3 minutes old when published; apps such as Transit discard these.${stale.length ? ` Worst: ${stale.sort((a, b) => b.staleShare - a.staleShare).slice(0, 6).map(c => `${coach(c.id)} ${pct(c.staleShare)}`).join(', ')}.` : ''}`,
+      look: ['On-board modem or GPS hardware on these coaches.', 'Positions being re-published without a new fix.'],
+    })
+    const sparse = Q.coaches.filter(c => c.reports >= T.sparseCoachMinReports && c.medianGap > T.sparseCoachGap)
+    if (sparse.length >= T.sparseCoaches) add({
+      key: 'sparse-coaches', severity: 'medium', category: 'Equipment', routes: [...new Set(sparse.flatMap(c => c.routes))],
+      title: `${plural(sparse.length, 'coach', 'coaches')} report their position too rarely`,
+      detail: `Median gap between reports over ${T.sparseCoachGap} seconds: ${sparse.slice(0, 6).map(c => `${coach(c.id)} ${Math.round(c.medianGap)} s`).join(', ')}.`,
+      look: ['AVL reporting interval configured on these coaches.', 'Cellular coverage on their routes.'],
+    })
+    const jumps = Q.coaches.filter(c => c.jumps >= T.jumpCoachMin).sort((a, b) => b.jumps - a.jumps)
+    if (jumps.length >= T.jumpCoaches) add({
+      key: 'gps-jumps', severity: 'low', category: 'Equipment', routes: [...new Set(jumps.flatMap(c => c.routes))],
+      title: `${plural(jumps.length, 'coach', 'coaches')} had repeated impossible jumps in position`,
+      detail: `Consecutive reports implying more than 26 m/s over more than 200 m (validator W004), ${T.jumpCoachMin}+ times in the day: ${jumps.slice(0, 6).map(c => `${coach(c.id)} (${c.jumps})`).join(', ')}.`
+        + (() => {
+          const series = new Map<string, number>()
+          for (const c of jumps) if (c.id.length >= 4) series.set(c.id.slice(0, -2), (series.get(c.id.slice(0, -2)) ?? 0) + 1)
+          const top = [...series].filter(([, n]) => n >= 3).sort((a, b) => b[1] - a[1])
+          return top.length ? ` ${top.map(([p, n]) => `${n} share the ID series ${p}xx`).join('; ')}, which suggests one vehicle type.` : ''
+        })(),
+      look: ['GPS receivers or antennas on these coaches.', 'Report timestamps that lag behind the position they carry.'],
+    })
+    const outA = Q.coaches.filter(c => c.outOfArea >= T.outOfAreaCoachMin)
+    if (outA.length >= T.outOfAreaCoaches) add({
+      key: 'out-of-area', severity: 'low', category: 'Equipment', routes: [...new Set(outA.flatMap(c => c.routes))],
+      title: `${plural(outA.length, 'coach', 'coaches')} reported in-service positions outside the service area`,
+      detail: `More than about 1.6 km from any route (validator E028): ${outA.slice(0, 6).map(c => `${coach(c.id)} (${c.outOfArea} reports)`).join(', ')}.`,
+      look: ['GPS faults, or vehicles logged in to a trip while out of service.'],
     })
   }
 

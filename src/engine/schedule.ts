@@ -25,6 +25,8 @@ export interface CompiledSchedule {
   stDep: Int32Array              // seconds since service-day base
   stStop: Int32Array             // index into stopIds
   stDist: Float64Array           // shape_dist_traveled (NaN when missing)
+  stTimepoint: Uint8Array        // 1 when stop_times.timepoint = 1
+  stopNames: Map<string, string>
   stopIds: string[]
   calendar: Map<string, { days: boolean[]; start: string; end: string }>
   calendarDates: Map<string, Map<string, number>> // date -> service_id -> exception_type
@@ -50,13 +52,16 @@ export async function readObjects(digest: string, table: string, columns?: strin
   }
 }
 
-async function readColumns(digest: string, table: string, columns: string[]) {
+async function readColumns(digest: string, table: string, wanted: string[]) {
   const file = await fileBuffer(scheduleUrl(digest, table))
+  const metadata = await parquetMetadataAsync(file)
+  const have = new Set(metadata.schema.map(s => s.name))
+  const columns = wanted.filter(c => have.has(c)) // optional columns may be absent
   const out: Record<string, unknown[]> = {}
   const parts: Record<string, { start: number; data: ArrayLike<unknown> }[]> = {}
   for (const c of columns) parts[c] = []
   await parquetRead({
-    file, columns, compressors,
+    file, metadata, columns, compressors,
     onChunk: ({ columnName, columnData, rowStart }) => { parts[columnName].push({ start: rowStart, data: columnData as ArrayLike<unknown> }) },
   })
   for (const c of columns) {
@@ -101,9 +106,11 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
     readObjects(digest, 'trips', ['route_id', 'service_id', 'trip_id', 'shape_id', 'block_id', 'direction_id', 'trip_headsign', 'fare_id']),
     readObjects(digest, 'calendar'),
     readObjects(digest, 'calendar_dates'),
-    readColumns(digest, 'stop_times', ['trip_id', 'stop_sequence', 'arrival_time', 'departure_time', 'stop_id', 'shape_dist_traveled']),
+    readColumns(digest, 'stop_times', ['trip_id', 'stop_sequence', 'arrival_time', 'departure_time', 'stop_id', 'shape_dist_traveled', 'timepoint']),
     readObjects(digest, 'fare_attributes', ['fare_id', 'descriptions']).catch(() => [] as Record<string, string | null>[]),
   ])
+  const stopRows = await readObjects(digest, 'stops', ['stop_id', 'stop_name']).catch(() => [] as Record<string, string | null>[])
+  const stopNames = new Map(stopRows.map(r => [r.stop_id ?? '', r.stop_name ?? '']))
   const fareDesc = new Map(fareRows.map(f => [f.fare_id ?? '', f.descriptions ?? '']))
   const routeFares = new Map<string, Map<string, number>>()
 
@@ -162,6 +169,8 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
   const stDep = new Int32Array(tripStart[nTrips])
   const stStop = new Int32Array(tripStart[nTrips])
   const stDist = new Float64Array(tripStart[nTrips])
+  const stTimepoint = new Uint8Array(tripStart[nTrips])
+  const tpCol = (st.timepoint ?? []) as (string | null)[]
   const stopIds: string[] = []
   const stopIdx = new Map<string, number>()
   const stopCol = st.stop_id as string[]
@@ -180,6 +189,7 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
     stStop[j] = si
     const dist = distCol[i]
     stDist[j] = dist == null || dist === '' ? NaN : Number(dist)
+    stTimepoint[j] = tpCol[i] === '1' ? 1 : 0
     let dep = gtfsTimeToSeconds(depCol[i])
     if (Number.isNaN(dep)) dep = gtfsTimeToSeconds(arrCol[i])
     stDep[j] = Number.isNaN(dep) ? -1 : dep
@@ -192,8 +202,8 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
     for (let j = a + 1; j < b; j++) if (stSeq[j] < stSeq[j - 1]) { sorted = false; break }
     if (!sorted) {
       const idx = Array.from({ length: b - a }, (_, k) => a + k).sort((x, y) => stSeq[x] - stSeq[y])
-      const s2 = idx.map(k => stSeq[k]), d2 = idx.map(k => stDep[k]), p2 = idx.map(k => stStop[k]), x2 = idx.map(k => stDist[k])
-      for (let k = 0; k < idx.length; k++) { stSeq[a + k] = s2[k]; stDep[a + k] = d2[k]; stStop[a + k] = p2[k]; stDist[a + k] = x2[k] }
+      const s2 = idx.map(k => stSeq[k]), d2 = idx.map(k => stDep[k]), p2 = idx.map(k => stStop[k]), x2 = idx.map(k => stDist[k]), t2 = idx.map(k => stTimepoint[k])
+      for (let k = 0; k < idx.length; k++) { stSeq[a + k] = s2[k]; stDep[a + k] = d2[k]; stStop[a + k] = p2[k]; stDist[a + k] = x2[k]; stTimepoint[a + k] = t2[k] }
     }
     let prev = -1
     for (let j = a; j < b; j++) {
@@ -220,7 +230,7 @@ async function compile(v: ScheduleVersion): Promise<CompiledSchedule> {
 
   return {
     digest, retrieved: v.date_retrieved, routes, routeIds, tripIndex,
-    tripRoute: Int32Array.from(tripRouteArr), tripService, tripShape, tripIds, tripBlock, tripDir, tripHeadsign, tripStart, stSeq, stDep, stStop, stDist, stopIds,
+    tripRoute: Int32Array.from(tripRouteArr), tripService, tripShape, tripIds, tripBlock, tripDir, tripHeadsign, tripStart, stSeq, stDep, stStop, stDist, stTimepoint, stopNames, stopIds,
     calendar, calendarDates,
   }
 }

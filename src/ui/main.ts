@@ -6,7 +6,7 @@ import type { FromWorker, ToWorker } from '../engine/protocol.ts'
 import { serviceOf } from './service.ts'
 import { diagnoseDay, mergeFindings, type Finding, type MergedFinding } from './diagnosis.ts'
 import { AccuracyMap, BANDS, COMP_BANDS, MIN_SEGMENT_N, MIN_SEGMENT_SCHEDULED, type MapMode, type StopCompStat, type StopStat } from './map.ts'
-import { STOP_COMP_FIELDS, STOP_FIELDS } from '../engine/metrics.ts'
+import { DIAG_VERSION, STOP_COMP_FIELDS, STOP_FIELDS } from '../engine/metrics.ts'
 import {
   coachLabels, coachName, coachRows, filterLabel, issuesIn, matchesFilter, recurring, recurringHtml, saveCsv,
   THRESHOLD_LABEL, toCsv, tripTable, tripsCsv, type CoachRow, type DatedIssue, type Fmt,
@@ -61,6 +61,7 @@ const state = {
   coachSort: { key: 'days', dir: -1 },
   notesOpen: new Set<string>(),         // dates whose unmatched-trip details are open
   diagChoice: '' as string,             // day picked in the diagnosis selector ('' = default)
+  diagOpen: new Set<string>(),          // expanded diagnosis findings (by key)
 }
 
 const key = (stride: number, date: string) => `${stride}|${date}`
@@ -328,26 +329,34 @@ function renderDiagnosis(a: ReturnType<typeof aggregate>) {
   const merged = mergeFindings(chosen.map(findingsFor))
   const routeNames = routeNameMap(a)
   for (const d of chosen) for (const [id, info] of Object.entries(d.routes)) routeNames[id] ??= info.short_name || id
-  const stale = chosen.filter(d => !d.diag || !d.unmatched)
+  const stale = chosen.filter(d => !d.diag || !d.unmatched || (d.diag.version ?? 1) < DIAG_VERSION)
   const count = (sev: string) => merged.filter(f => f.severity === sev).length
   const card = (f: MergedFinding) => {
     const routes = f.routes.slice(0, 14)
-    return `<article class="finding sev-${f.severity}">
-      <header><span class="sev">${f.severity}</span><h3>${esc(f.title)}</h3>
-        ${chosen.length > 1 ? `<span class="days-seen">on ${f.dates.length} of ${chosen.length} days</span>` : ''}<span class="cat">${esc(f.category)}</span></header>
+    return `<details class="finding sev-${f.severity}" data-key="${esc(f.key)}" ${state.diagOpen.has(f.key) ? 'open' : ''}>
+      <summary><span class="sev">${f.severity}</span><h3>${esc(f.title)}</h3>
+        ${chosen.length > 1 ? `<span class="days-seen">on ${f.dates.length} of ${chosen.length} days</span>` : ''}<span class="cat">${esc(f.category)}</span></summary>
+      <div class="finding-body">
       <p>${esc(f.detail)}</p>
       <div class="look"><b>Where to look</b><ul>${f.look.map(l => `<li>${esc(l)}</li>`).join('')}</ul></div>
       ${routes.length ? `<div class="rchips">${routes.map(r => `<button data-route="${esc(r)}" title="Show route ${esc(routeNames[r] ?? r)} on the map">${esc(routeNames[r] ?? r)}</button>`).join('')}${f.routes.length > routes.length ? `<span class="muted small">+${f.routes.length - routes.length} more</span>` : ''}</div>` : ''}
-    </article>`
+      </div>
+    </details>`
   }
   const main = merged.filter(f => f.severity !== 'low'), low = merged.filter(f => f.severity === 'low')
   els.diagBody.innerHTML = `
-    <p class="summary">${merged.length ? `${merged.length} finding${merged.length > 1 ? 's' : ''}: ${count('high')} high, ${count('medium')} medium, ${count('low')} low priority.` : 'No patterns found.'}
+    <p class="summary">${merged.length ? `${merged.length} finding${merged.length > 1 ? 's' : ''}: ${count('high')} high, ${count('medium')} medium, ${count('low')} low priority. Click a finding for the evidence and where to look.` : 'No patterns found.'}
       ${chosen.length > 1 ? ' Findings with the same subject are merged across days.' : ''}</p>
     ${stale.length ? `<p class="hint">${stale.map(d => fmtDate(d.date)).join(', ')} ${stale.length > 1 ? 'were' : 'was'} saved before some of the facts the diagnosis uses were recorded, so a few rules are skipped. <button data-diag-reanalyze="${stale.map(d => d.date).join(',')}">Analyze ${stale.length > 1 ? 'these days' : 'this day'} again</button></p>` : ''}
     <div class="findings">${main.map(card).join('')}</div>
     ${low.length ? `<details class="more" ${main.length ? '' : 'open'}><summary>${low.length} lower-priority finding${low.length > 1 ? 's' : ''}</summary><div class="findings">${low.map(card).join('')}</div></details>` : ''}`
 }
+
+els.diagBody.addEventListener('toggle', ev => {
+  const el = ev.target as HTMLElement
+  if (!(el instanceof HTMLDetailsElement) || !el.dataset.key) return
+  if (el.open) state.diagOpen.add(el.dataset.key); else state.diagOpen.delete(el.dataset.key)
+}, true)
 
 els.diagDay.addEventListener('change', () => {
   state.diagChoice = els.diagDay.value === 'all' ? '' : els.diagDay.value

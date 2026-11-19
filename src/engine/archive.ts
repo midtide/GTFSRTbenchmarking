@@ -20,9 +20,10 @@ export const KCM = {
 export type FeedType = 'trip_updates' | 'vehicle_positions'
 
 export const COLUMNS: Record<FeedType, string[]> = {
-  trip_updates: ['feed_timestamp', 'trip_id', 'route_id', 'start_date', 'start_time', 'schedule_relationship', 'vehicle_id',
+  trip_updates: ['feed_timestamp', 'trip_id', 'route_id', 'direction_id', 'start_date', 'start_time', 'schedule_relationship', 'vehicle_id',
     'stop_sequence', 'departure_time', 'stop_schedule_relationship'],
-  vehicle_positions: ['trip_id', 'route_id', 'start_date', 'current_stop_sequence', 'current_status', 'timestamp', 'vehicle_id', 'vehicle_label'],
+  vehicle_positions: ['trip_id', 'route_id', 'start_date', 'current_stop_sequence', 'current_status', 'timestamp', 'vehicle_id', 'vehicle_label',
+    'latitude', 'longitude'],
 }
 
 /** Bytes moved over the network by this module (for progress display). */
@@ -106,9 +107,11 @@ export interface FileIndex {
   metadata: FileMetaData
   /** per row group: poll time (epoch seconds) */
   times: Float64Array
+  /** per row group: the feed header timestamp (epoch seconds; NaN if unknown) */
+  feedTimes: Float64Array
 }
 
-const INDEX_VERSION = 4
+const INDEX_VERSION = 5
 const memIndex = new Map<string, Promise<FileIndex | null>>()
 
 export function getFileIndex(feed: FeedType, utcDate: string): Promise<FileIndex | null> {
@@ -145,6 +148,7 @@ async function loadFileIndex(feed: FeedType, url: string): Promise<FileIndex | n
 
   const wanted = new Set(COLUMNS[feed])
   const times = new Float64Array(full.row_groups.length)
+  const feedTimes = new Float64Array(full.row_groups.length).fill(NaN)
   const row_groups: RowGroup[] = full.row_groups.map((rg, i) => {
     const columns: ColumnChunk[] = []
     // Row-group time = poll (fetch) time. Each file has one row group per poll.
@@ -156,8 +160,10 @@ async function loadFileIndex(feed: FeedType, url: string): Promise<FileIndex | n
       if (name === 'fetch_timestamp' && md.statistics?.min_value != null) {
         const v = md.statistics.min_value as unknown
         t = v instanceof Date ? v.getTime() / 1000 : Number(v) / 1e6
-      } else if (name === 'feed_timestamp' && Number.isNaN(t) && md.statistics?.min_value != null) {
-        t = Number(md.statistics.min_value)
+      }
+      if (name === 'feed_timestamp' && md.statistics?.min_value != null) {
+        feedTimes[i] = Number(md.statistics.min_value)
+        if (Number.isNaN(t)) t = feedTimes[i]
       }
       if (!wanted.has(name)) continue
       columns.push({
@@ -177,7 +183,7 @@ async function loadFileIndex(feed: FeedType, url: string): Promise<FileIndex | n
     version: full.version, schema: full.schema, num_rows: full.num_rows,
     row_groups, metadata_length: full.metadata_length,
   } as FileMetaData
-  const index: FileIndex = { url, byteLength, etag, metadata, times }
+  const index: FileIndex = { url, byteLength, etag, metadata, times, feedTimes }
   await cachePut('fileIndex', cacheKey, index)
   return index
 }
@@ -245,12 +251,15 @@ async function prefetchedBuffer(index: FileIndex, rowGroups: RowGroup[], gap: nu
 }
 
 /** Read the given row groups (indexes into the file) and return whole columns. */
-export async function readRowGroups(index: FileIndex, groups: number[], columns: string[], gap = 32 << 10): Promise<{ n: number; cols: Columns }> {
+export async function readRowGroups(index: FileIndex, groups: number[], columns: string[], gap = 32 << 10): Promise<{ n: number; cols: Columns; starts: number[] }> {
   const metadata = {
     ...index.metadata,
     row_groups: groups.map(i => index.metadata.row_groups[i]),
   } as FileMetaData
   const n = metadata.row_groups.reduce((a, rg) => a + Number(rg.num_rows), 0)
+  // starts[k] = first row of groups[k]; starts[groups.length] = n
+  const starts: number[] = [0]
+  for (const rg of metadata.row_groups) starts.push(starts[starts.length - 1] + Number(rg.num_rows))
   metadata.num_rows = BigInt(n)
   const parts: Record<string, { start: number; data: ArrayLike<unknown> }[]> = {}
   for (const c of columns) parts[c] = []
@@ -271,5 +280,5 @@ export async function readRowGroups(index: FileIndex, groups: number[], columns:
     for (const ch of chunks) for (let i = 0; i < ch.data.length; i++) out[ch.start + i] = ch.data[i]
     cols[c] = out
   }
-  return { n, cols }
+  return { n, cols, starts }
 }

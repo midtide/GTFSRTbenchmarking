@@ -140,8 +140,15 @@ export interface UnmatchedTrip {
   foundIn?: string
 }
 
+import type { DayQuality } from './quality.ts'
+
+/** Bump when the diagnostics recorded per day change (older saved days offer re-analysis). */
+export const DIAG_VERSION = 2
+
 /** Extra per-day facts used by the daily diagnosis. */
 export interface DayDiagnostics {
+  version?: number
+  quality?: DayQuality
   /** routes whose trips ran although their service_id is not active that day */
   offCalendar: { route: string; trips: number; withVehicle: number; services: string[] }[]
   /** scheduled (active) trips per route and direction, and how many had a vehicle or were canceled */
