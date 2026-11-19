@@ -338,6 +338,7 @@ function renderDiagnosis(a: ReturnType<typeof aggregate>) {
         ${chosen.length > 1 ? `<span class="days-seen">on ${f.dates.length} of ${chosen.length} days</span>` : ''}<span class="cat">${esc(f.category)}</span></summary>
       <div class="finding-body">
       <p>${esc(f.detail)}</p>
+      ${f.impact ? `<p class="impact"><b>Rider impact:</b> ${esc(f.impact)}</p>` : ''}
       <div class="look"><b>Where to look</b><ul>${f.look.map(l => `<li>${esc(l)}</li>`).join('')}</ul></div>
       ${routes.length ? `<div class="rchips">${routes.map(r => `<button data-route="${esc(r)}" title="Show route ${esc(routeNames[r] ?? r)} on the map">${esc(routeNames[r] ?? r)}</button>`).join('')}${f.routes.length > routes.length ? `<span class="muted small">+${f.routes.length - routes.length} more</span>` : ''}</div>` : ''}
       </div>

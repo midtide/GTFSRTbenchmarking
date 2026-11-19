@@ -17,6 +17,8 @@ export interface Finding {
   title: string
   /** evidence, plain text (escaped when rendered) */
   detail: string
+  /** one line on what riders likely experience */
+  impact: string
   /** where to look for causes */
   look: string[]
   routes: string[]
@@ -63,6 +65,50 @@ export const THRESHOLDS = {
 }
 const T = THRESHOLDS
 
+/** Likely rider impact, by finding type (the part of the key before "|"). */
+const IMPACT: Record<string, string> = {
+  'offcal': 'Riders on this route see scheduled times only for the trips the schedule expects, while the buses actually running may show up in apps unpredictably or not at all.',
+  'unmatched': 'Riders on these trips get no live arrival times in apps that match trips to the schedule; buses arrive with only a timetable time, or none, on screen.',
+  'cancel-unmatched': 'Riders may still see canceled trips as coming and wait for a bus that never arrives.',
+  'route-missing': 'Riders on this route get schedule-only times all day and can\'t tell whether a bus is running late, early or at all.',
+  'dir-missing': 'Riders traveling in this direction see only timetable times, so a late or missing bus looks the same as one on time.',
+  'blocks-unstaffed': 'Trips that likely never ran still appeared at their scheduled times, so riders waited for buses that didn\'t come.',
+  'blocks-partial': 'For parts of the day riders on these trips saw scheduled times instead of live ones, with no warning if a bus was missing.',
+  'pattern-start': 'Riders boarding near the start of these trips (often at busy terminals and transit centers) see no live time until the bus is already on its way.',
+  'pattern-end': 'Riders boarding near the end of these routes lose live times just before the bus arrives.',
+  'coaches': 'Riders on trips run by these coaches lose live arrival times partway through the trip, wherever the bus happens to be.',
+  'group': 'Riders on this service type get noticeably less reliable or less available live information than riders on Metro\'s main bus routes.',
+  'early-bias': 'Riders who trust the countdown arrive at the stop just as, or just after, the bus has left: the costliest kind of prediction error.',
+  'late-bias': 'Riders wait longer at the stop than the countdown suggested.',
+  'low-accuracy': 'Riders on these routes can\'t rely on the countdown and must pad their trips with extra waiting time.',
+  'hour-dips': 'Riders traveling in these hours are more likely to see schedule-only times or no arrival information.',
+  'partial': 'No direct rider impact; this is a gap in the archive, so the day\'s figures are incomplete.',
+  'ghost': 'Riders were shown a bus coming in the next few minutes that never arrived: they waited, missed connections, or gave up on the trip.',
+  'timetable-live': 'Riders see these times as live when they are only the schedule, so a late or missing bus gives no warning until it fails to appear.',
+  'jitter': 'Riders watching the countdown see it jump up and down, can\'t judge when to leave for the stop, and lose trust in the app.',
+  'timepoint-early': 'Riders who arrive on schedule, or by the countdown, miss buses that left early and wait for the next one.',
+  'frozen': 'While the feed was frozen, riders saw countdowns stuck in place and buses that appeared not to move.',
+  'age': 'Riders see bus locations and countdowns that are already out of date when they open the app.',
+  'refresh': 'Countdowns and bus locations update in jumps, making it harder to judge a bus that is close.',
+  'past': 'Riders see "now" or "departed" for a bus that hasn\'t come yet, and may leave the stop or try another route.',
+  'canceled-ran': 'Riders were told their bus was canceled and made other plans while the bus actually ran.',
+  'late-first': 'Riders planning ahead see only the schedule until shortly before the bus comes, too late to adjust their plans.',
+  'coverage': 'Live times flicker on and off, so riders sometimes see a countdown and sometimes only the schedule for the same bus.',
+  'pairing': 'Apps may show a bus on the map that doesn\'t match the countdown, or link a countdown to the wrong vehicle.',
+  'dup-trips': 'Riders may see two buses for one trip, or a countdown that switches between vehicles.',
+  'veh-two-trips': 'Briefly, riders may see the same bus on two trips, with conflicting countdowns.',
+  'one-feed': 'Riders see a bus on the map with no countdown, or a countdown with no bus on the map.',
+  'bad-seq': 'Predictions for some stops are missing or attached to the wrong stop, so riders at those stops see schedule-only times.',
+  'id-mismatch': 'Apps may show these trips under the wrong route or direction, or drop them.',
+  'added-in-gtfs': 'Apps may show these trips twice, or ignore them.',
+  'detours': 'Riders at the skipped stops need a service alert to know their stop isn\'t served; without one they wait for a bus that won\'t stop there.',
+  'off-route': 'Riders see the bus somewhere unexpected on the map, and countdowns along the regular route may be wrong.',
+  'stale-coaches': 'Riders see these buses frozen on the map or disappearing (many apps drop positions over 3 minutes old), and countdowns may fall back to the schedule.',
+  'sparse-coaches': 'These buses move in jumps on the map and their countdowns update slowly.',
+  'gps-jumps': 'Riders see these buses jump around the map, and countdowns can swing as a result.',
+  'out-of-area': 'Riders may see these buses in impossible places, or their trips may vanish from apps.',
+}
+
 const pct = (x: number, d = 0) => `${(x * 100).toFixed(d)}%`
 const localClock = (() => {
   const f = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', minute: '2-digit' })
@@ -83,7 +129,7 @@ export function diagnoseDay(day: DayResult, ctx: Ctx): Finding[] {
   const rt = new Set(day.rtRoutes)
   const name = (id: string) => day.routes[id]?.short_name || id
   const date = day.date
-  const add = (f: Omit<Finding, 'date'>) => out.push({ ...f, date })
+  const add = (f: Omit<Finding, 'date' | 'impact'>) => out.push({ ...f, impact: IMPACT[f.key.split('|')[0]] ?? '', date })
   const flagged = new Set<string>() // routes already explained by a higher-level finding
   const diag = day.diag
 
@@ -662,7 +708,7 @@ export function mergeFindings(perDay: Finding[][]): MergedFinding[] {
       if (!e) { const { date, ...rest } = f; m.set(f.key, { ...rest, dates: [date] }); continue }
       e.dates.push(f.date)
       if (SEVERITY_ORDER[f.severity] < SEVERITY_ORDER[e.severity]) e.severity = f.severity
-      if (f.date > e.dates[e.dates.length - 2]) { e.title = f.title; e.detail = f.detail; e.look = f.look }
+      if (f.date > e.dates[e.dates.length - 2]) { e.title = f.title; e.detail = f.detail; e.look = f.look; e.impact = f.impact }
       e.routes = [...new Set([...e.routes, ...f.routes])]
     }
   }

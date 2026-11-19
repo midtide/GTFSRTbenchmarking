@@ -249,3 +249,5 @@ table.data th[data-key="service"] { text-align: left; }
 .finding .rchips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .finding .rchips button { min-height: 0; padding: 1px 8px; font-size: 12px; border-radius: 999px; }
 #diag-body details.more > summary { cursor: pointer; margin: 10px 0 6px; color: var(--accent-ink); font-size: 14px; }
+.finding .impact { font-size: 14px; color: var(--text); background: var(--surface-2); border-radius: 6px; padding: 6px 10px; margin: 8px 0; }
+.finding .impact b { font-weight: 600; }
